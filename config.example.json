@@ -1,0 +1,16 @@
+{
+  "ping_targets": ["8.8.8.8", "1.1.1.1"],
+  "watched_processes": ["obs64", "vMix64"],
+  "ram_alert_mb": 3072,
+  "disk_paths": ["C:\\"],
+  "eq_bands": 24,
+  "eq_fps": 60,
+  "drive_label": "brndz.wav",
+  "audio_io_poll_s": 1.0,
+  "audio_io_clip_threshold": 0.98,
+  "recording_enabled": true,
+  "recording_directory": "",
+  "recording_sample_rate": 48000,
+  "recording_channels": 2,
+  "recording_bit_depth": 16
+}

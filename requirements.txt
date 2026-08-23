@@ -1,0 +1,20 @@
+psutil==7.2.2
+# nvidia-ml-py is NVIDIA's official package; it installs as `import pynvml`.
+# The PyPI package literally named "pynvml" is a deprecated third-party wrapper.
+nvidia-ml-py==13.610.43
+PyAudioWPatch==0.2.12.8
+numpy==2.5.2
+# pygame-ce instead of pygame: same `import pygame` API, but ships prebuilt
+# wheels for current Python much faster than upstream pygame does.
+pygame-ce==2.5.8
+# Reads the system master volume/mute via Windows Core Audio (COM) so the
+# EQ reacts to the actual output level -- WASAPI loopback taps the mix
+# *before* the master volume gain stage, so without this the meter ignores
+# the OS volume slider entirely (only per-app volume shows up).
+pycaw==20251023
+comtypes==1.4.16
+# LAME MP3 encoder bindings -- a compiled wheel with no external binary/DLL
+# to ship or find on PATH, ~150KB installed. Small and focused enough to
+# satisfy the "no heavy encoder" constraint that kept MP3 recording out of
+# earlier rounds; WAV stays the default, MP3 is opt-in per recording.
+lameenc==1.8.4
