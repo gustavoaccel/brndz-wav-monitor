@@ -7,3 +7,4 @@ config.json
 *_resumo.md
 build/
 dist/
+rec/

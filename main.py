@@ -5,6 +5,7 @@ import os
 import queue
 import subprocess
 import sys
+import threading
 import time
 import traceback
 import winsound
@@ -125,9 +126,12 @@ def _flush_dns(logger=None, renderer=None):
     seconds -- exactly the wrong moment during a live event. A stale/
     corrupted DNS cache is a common enough cause of "sites won't load but
     the connection is up" that flushing it costs nothing and can only help.
-    Runs synchronously (blocks the render loop briefly) -- same tradeoff
-    as _browse_folder's PowerShell call: an occasional manual click, not
-    something polled, and ipconfig /flushdns completes near-instantly.
+    Runs synchronously (blocks the render loop briefly) -- fine here
+    specifically because ipconfig /flushdns has a short, deterministic
+    runtime and no user interaction to wait on. NOT the same tradeoff as
+    the folder picker (see _start_folder_browse): a picker dialog waits on
+    however long a human takes to navigate, which measured in the tens of
+    seconds is long enough for Windows to flag the whole window as hung.
     """
     try:
         result = subprocess.run(
@@ -148,15 +152,19 @@ def _flush_dns(logger=None, renderer=None):
         renderer.push_event("Cache DNS limpo" if ok else "Falha ao limpar cache DNS", severity="warn" if ok else "crit")
 
 
-def _browse_folder(initial_dir: str) -> "str | None":
-    """Native folder picker via a PowerShell one-liner (System.Windows.Forms
-    FolderBrowserDialog) instead of hand-rolling a picker in pygame -- this
-    is a manual, occasional action, a brief subprocess is fine here even
-    though it'd be too heavy for anything polled continuously."""
+def _browse_folder_worker(initial_dir: str, result_q: "queue.Queue[str | None]"):
+    """Runs on its own thread -- see _start_folder_browse for why. Native
+    folder picker via a PowerShell one-liner (System.Windows.Forms
+    FolderBrowserDialog) instead of hand-rolling a picker in pygame.
+    """
+    # PowerShell single-quoted strings escape an embedded ' by doubling it
+    # -- without this, a directory path that happens to contain a quote
+    # would break the generated script instead of just picking oddly.
+    safe_dir = initial_dir.replace("'", "''")
     script = (
         "Add-Type -AssemblyName System.Windows.Forms | Out-Null; "
         "$f = New-Object System.Windows.Forms.FolderBrowserDialog; "
-        f"$f.SelectedPath = '{initial_dir}'; "
+        f"$f.SelectedPath = '{safe_dir}'; "
         "if ($f.ShowDialog() -eq 'OK') { Write-Output $f.SelectedPath }"
     )
     try:
@@ -165,9 +173,30 @@ def _browse_folder(initial_dir: str) -> "str | None":
             capture_output=True, text=True, timeout=120, creationflags=_CREATE_NO_WINDOW,
         )
         path = result.stdout.strip()
-        return path or None
+        result_q.put(path or None)
     except Exception:
-        return None
+        result_q.put(None)
+
+
+def _start_folder_browse(initial_dir: str) -> "queue.Queue[str | None]":
+    """Launches the folder picker on a background thread and returns the
+    queue its result lands on -- NEVER call the picker synchronously on
+    the main thread.
+
+    Confirmed the hard way: a user's session hit Windows' own "Application
+    Hang" detector (Event Viewer: AppHangB1, Windows Error Reporting
+    force-closed the process) while browsing for a folder -- the picker
+    dialog can legitimately stay open for as long as someone takes to
+    navigate, and a synchronous subprocess.run() for that whole time
+    blocks pygame's message pump completely, which Windows reads as "this
+    program stopped responding" and can kill outright. Same
+    thread+queue+poll-once-per-frame shape as every other background I/O
+    in this app -- the picker being manual/occasional never justified
+    blocking the one thread that has to keep pumping window messages.
+    """
+    q: "queue.Queue[str | None]" = queue.Queue(maxsize=1)
+    threading.Thread(target=_browse_folder_worker, args=(initial_dir, q), daemon=True).start()
+    return q
 
 
 def _truncate_text(font, text, max_w):
@@ -327,16 +356,15 @@ def _toggle_recording(recorder, thread, logger, renderer, sample_rate, channels,
     files without any risk of mixing.
     """
     if recorder.is_active():
+        # stop() only flips the REC button off right away -- the file
+        # isn't actually finished/closed until the recorder's own writer
+        # thread drains whatever's still queued (see audio_recorder.py).
+        # The generic per-frame pop_last_saved() poll below (same one that
+        # already handles a mid-recording auto-stop) picks up the "saved"
+        # log/toast whenever that lands, a frame or few later -- not
+        # necessarily this one.
         recorder.stop()
         thread.set_recording_sink(None)
-        saved = recorder.pop_last_saved()
-        if saved:
-            logger.add_event(f"Recording ({label}) saved: {saved['filename']}", level="OK", source="RECORDING", event="REC_SAVED")
-            logger.add_recording(
-                saved["filename"], saved["started_at"], saved["ended_at"],
-                saved["format"], saved["sample_rate"], saved["channels"], saved["size_bytes"],
-            )
-            renderer.push_event(f"Gravação ({label}) salva: {saved['filename']}", severity="warn")
         return
 
     ok, detail = recorder.start(sample_rate, channels)
@@ -435,6 +463,7 @@ def main():
     dragging_window = False
     drag_offset = (0, 0)
     compact_restore_rect = pygame.Rect(0, 0, 0, 0)
+    compact_theme_rect = pygame.Rect(0, 0, 0, 0)
 
     selected_device_name = None  # None = automatic (follow Windows default)
     device_dropdown_open = False
@@ -443,8 +472,11 @@ def main():
     confirm_exit_open = False
     audio_settings_browse_rect = pygame.Rect(0, 0, 0, 0)
     audio_settings_close_rect = pygame.Rect(0, 0, 0, 0)
+    folder_browse_queue = None  # non-None while the background picker thread is running
     audio_settings_wav_rect = pygame.Rect(0, 0, 0, 0)
     audio_settings_mp3_rect = pygame.Rect(0, 0, 0, 0)
+    audio_settings_gain_minus_rect = pygame.Rect(0, 0, 0, 0)
+    audio_settings_gain_plus_rect = pygame.Rect(0, 0, 0, 0)
 
     running = True
     while running:
@@ -499,11 +531,9 @@ def main():
                     renderer.log_history_open = False
                 elif renderer.audio_settings_open:
                     if audio_settings_browse_rect.collidepoint(event.pos):
-                        directory, _ = resolve_recording_dir(cfg)
-                        picked = _browse_folder(str(directory))
-                        if picked:
-                            cfg.recording_directory = picked
-                            logger.add_event(f"Pasta de gravação alterada: {picked}", level="INFO", source="RECORDING", event="REC_DIR_CHANGED")
+                        if folder_browse_queue is None:  # ignore a repeat click while one's already open
+                            directory, _ = resolve_recording_dir(cfg)
+                            folder_browse_queue = _start_folder_browse(str(directory))
                     elif audio_settings_wav_rect.collidepoint(event.pos):
                         if cfg.recording_format != "wav":
                             cfg.recording_format = "wav"
@@ -512,6 +542,14 @@ def main():
                         if cfg.recording_format != "mp3":
                             cfg.recording_format = "mp3"
                             logger.add_event("Formato de gravação: MP3", level="INFO", source="RECORDING", event="REC_FORMAT_CHANGED")
+                    elif audio_settings_gain_minus_rect.collidepoint(event.pos):
+                        cfg.mic_boost_db = max(0.0, cfg.mic_boost_db - 2.0)
+                        audio_io_thread.set_gain_db(cfg.mic_boost_db)
+                        logger.add_event(f"Ganho do mic: +{cfg.mic_boost_db:.0f}dB", level="INFO", source="RECORDING", event="MIC_GAIN_CHANGED")
+                    elif audio_settings_gain_plus_rect.collidepoint(event.pos):
+                        cfg.mic_boost_db = min(30.0, cfg.mic_boost_db + 2.0)
+                        audio_io_thread.set_gain_db(cfg.mic_boost_db)
+                        logger.add_event(f"Ganho do mic: +{cfg.mic_boost_db:.0f}dB", level="INFO", source="RECORDING", event="MIC_GAIN_CHANGED")
                     elif audio_settings_close_rect.collidepoint(event.pos):
                         renderer.audio_settings_open = False
                     else:
@@ -520,6 +558,8 @@ def main():
                     if compact_restore_rect.collidepoint(event.pos):
                         compact_mode = False
                         screen = _exit_compact_mode(normal_window_size, always_on_top)
+                    elif compact_theme_rect.collidepoint(event.pos):
+                        renderer.cycle_compact_color_theme()
                     else:
                         # No title bar to drag by -- track the grab offset in
                         # screen coordinates and reposition the window under
@@ -725,11 +765,23 @@ def main():
                 _beep("crit")
             rec_saved = rec.pop_last_saved()
             if rec_saved:
-                logger.add_event(f"Recording ({rec_label}) saved: {rec_saved['filename']}", level="OK", source="RECORDING", event="REC_SAVED")
+                dropped = rec_saved.get("dropped_chunks")
+                if dropped:
+                    # Real but rare: the write-behind buffer (~25s) filled
+                    # up because the disk was stuck that whole time, not
+                    # just momentarily slow -- the take saved fine overall
+                    # but has a gap in it.
+                    logger.add_event(
+                        f"Recording ({rec_label}) saved with {dropped} dropped chunk(s) (disco lento/travado durante a gravação): {rec_saved['filename']}",
+                        level="WARNING", source="RECORDING", event="REC_SAVED_GAPS",
+                    )
+                else:
+                    logger.add_event(f"Recording ({rec_label}) saved: {rec_saved['filename']}", level="OK", source="RECORDING", event="REC_SAVED")
                 logger.add_recording(
                     rec_saved["filename"], rec_saved["started_at"], rec_saved["ended_at"],
                     rec_saved["format"], rec_saved["sample_rate"], rec_saved["channels"], rec_saved["size_bytes"],
                 )
+                renderer.push_event(f"Gravação ({rec_label}) salva: {rec_saved['filename']}", severity="warn")
 
         for snap in drain_all(network_q):
             latest_network = snap
@@ -759,6 +811,16 @@ def main():
             logger.log_row(latest_stats, latest_network)
             last_logged_ts = latest_stats.timestamp
 
+        if folder_browse_queue is not None:
+            try:
+                picked = folder_browse_queue.get_nowait()
+                folder_browse_queue = None
+                if picked:
+                    cfg.recording_directory = picked
+                    logger.add_event(f"Pasta de gravação alterada: {picked}", level="INFO", source="RECORDING", event="REC_DIR_CHANGED")
+            except queue.Empty:
+                pass  # picker dialog still open -- keep rendering normally, check again next frame
+
         # Status dot: latch red the first time any ERROR/CRASH/HANG-level
         # event lands, from whatever source (audio/network/process/
         # recording) -- scanning the tail of the already-append-only
@@ -773,6 +835,7 @@ def main():
         if compact_mode:
             renderer.draw_compact(screen, theme.COMPACT_COLORKEY)
             compact_restore_rect = renderer.draw_compact_restore_button(screen)
+            compact_theme_rect = renderer.draw_compact_theme_button(screen, compact_restore_rect)
         else:
             w, h = screen.get_size()
             content = screen.subsurface((0, HEADER_H, w, max(0, h - HEADER_H)))
@@ -831,8 +894,9 @@ def main():
                 else:
                     detail = f"{cfg.recording_sample_rate / 1000:.1f}kHz · {cfg.recording_channels}ch · {cfg.recording_bit_depth}-bit"
                 (audio_settings_browse_rect, audio_settings_close_rect,
-                 audio_settings_wav_rect, audio_settings_mp3_rect) = renderer.draw_audio_settings_popup(
-                    screen, str(directory), cfg.recording_format, detail,
+                 audio_settings_wav_rect, audio_settings_mp3_rect,
+                 audio_settings_gain_minus_rect, audio_settings_gain_plus_rect) = renderer.draw_audio_settings_popup(
+                    screen, str(directory), cfg.recording_format, detail, cfg.mic_boost_db,
                 )
 
             if renderer.log_history_open:

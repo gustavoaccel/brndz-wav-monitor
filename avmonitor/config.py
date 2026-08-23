@@ -46,6 +46,22 @@ class Config:
     audio_device_poll_s: float = 1.5
     audio_io_poll_s: float = 1.0
     audio_io_clip_threshold: float = 0.98
+    # Mic input gain applied in software, in dB, before both the IN
+    # meter and any mic recording -- some interfaces/headset mics
+    # deliver a genuinely quiet raw signal (confirmed directly: -54.8dB
+    # RMS / -37.2dB peak on a real recording, with the Windows input
+    # volume already at 94%, not muted -- the raw capture is just quiet
+    # at the source). Applied with a hard clip so a loud moment can never
+    # wrap/overflow instead of just flattening at full scale.
+    #
+    # Deviates from the original spec's "no processing" rule for
+    # recordings (no normalize/compressor/limiter/EQ) -- explicitly
+    # requested by the user after hearing a too-quiet mic recording.
+    # +20dB (the first value tried) was reported too loud on real
+    # hardware, so the default was lowered to +12dB and a "GANHO DO MIC"
+    # -/+ stepper was added to the ÁUDIO I/O settings popup (0-30dB, 2dB
+    # steps) so the user can tune it live instead of editing config.json.
+    mic_boost_db: float = 12.0
 
     recording_enabled: bool = True
     # Empty = auto: same brndz.wav-drive-then-fallback resolution as

@@ -166,6 +166,47 @@ def move_window(hwnd: int, x: int, y: int) -> bool:
     return bool(user32.SetWindowPos(hwnd, None, x, y, 0, 0, _SWP_NOSIZE | _SWP_NOZORDER | _SWP_NOACTIVATE))
 
 
+_THREAD_PRIORITY_TIME_CRITICAL = 15
+_THREAD_PRIORITY_NORMAL = 0
+
+# Explicit signatures required here -- GetCurrentThread() returns a 64-bit
+# HANDLE pseudo-value; ctypes' default restype (32-bit c_int) silently
+# truncates it, and SetThreadPriority then receives a garbage handle and
+# fails without raising (confirmed directly: SetThreadPriority returned
+# False and GetThreadPriority read back THREAD_PRIORITY_ERROR_RETURN with
+# undeclared signatures, both fixed by declaring these).
+kernel32.GetCurrentThread.argtypes = []
+kernel32.GetCurrentThread.restype = wintypes.HANDLE
+kernel32.SetThreadPriority.argtypes = [wintypes.HANDLE, ctypes.c_int]
+kernel32.SetThreadPriority.restype = wintypes.BOOL
+
+
+def set_current_thread_priority(time_critical: bool) -> bool:
+    """Raise (or restore) the *calling* thread's OS scheduling priority --
+    must be called from the thread it should affect, since
+    GetCurrentThread() returns a pseudo-handle meaning "whoever's asking".
+
+    Used to make a real-time audio capture thread the OS's top scheduling
+    priority for as long as a recording is actually running on it, so a
+    GIL/CPU contention spike elsewhere in the app (60fps render, a WMI/COM
+    call on another thread, real system load from OBS/vMix) can't delay
+    the next stream.read() long enough to overflow the driver's own ring
+    buffer and silently drop audio -- confirmed directly (wall-clock vs.
+    recorded-file-duration mismatch) that this class of stall still causes
+    real, measurable loss even after the capture loop itself was fixed to
+    always drain everything available. THREAD_PRIORITY_TIME_CRITICAL is
+    the standard Win32 priority class for exactly this use case (used by
+    professional real-time audio software generally). Only elevated while
+    a recording is active -- restored to normal the rest of the time, so
+    the app stays as light as before whenever nothing is being recorded.
+    """
+    try:
+        priority = _THREAD_PRIORITY_TIME_CRITICAL if time_critical else _THREAD_PRIORITY_NORMAL
+        return bool(kernel32.SetThreadPriority(kernel32.GetCurrentThread(), priority))
+    except Exception:
+        return False
+
+
 # ---- process launching / elevation -----------------------------------
 #
 # Task Manager was launched via a bare `subprocess.Popen(["taskmgr.exe"])`,

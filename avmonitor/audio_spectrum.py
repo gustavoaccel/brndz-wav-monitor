@@ -14,7 +14,8 @@ from typing import List, Optional, Tuple
 import numpy as np
 
 from .master_volume import MasterVolumeReader
-from .util import push_latest, PORTAUDIO_INIT_LOCK
+from .util import push_latest, PORTAUDIO_INIT_LOCK, DeviceWatcher
+from . import win_native
 
 
 def _live_default_output_name() -> Optional[str]:
@@ -133,6 +134,12 @@ class AudioSpectrumAnalyzer(threading.Thread):
         self._recording_sink = None
         self.current_sample_rate = 0
         self.current_channels = 0
+        # Tracks whether this thread's OS priority is currently raised --
+        # compared against `self._recording_sink is not None` once per
+        # capture-loop iteration so the syscall only fires on a genuine
+        # start/stop transition, not every chunk. See
+        # win_native.set_current_thread_priority()'s docstring.
+        self._priority_raised = False
 
     def stop(self):
         self._stop_event.set()
@@ -173,6 +180,18 @@ class AudioSpectrumAnalyzer(threading.Thread):
 
         master_volume = MasterVolumeReader()
 
+        # Resolves "which device is current" on its own thread/PyAudio()
+        # instance -- confirmed in the field that doing this inline, in
+        # the real-time capture loop's periodic recheck, could take up to
+        # ~86ms (more than a whole chunk's ~85ms time budget) and cause
+        # real audible glitches in exactly what was being captured/
+        # recorded. See util.DeviceWatcher's docstring.
+        watcher = DeviceWatcher(self._find_loopback_device, self.cfg.audio_device_poll_s)
+        watcher.start()
+        deadline = time.time() + 2.0
+        while watcher.current is None and time.time() < deadline and not self._stop_event.is_set():
+            time.sleep(0.02)
+
         # Construction (and, symmetrically, termination) of PyAudio() is not
         # safe to run concurrently with AudioIOMonitor's -- see
         # util.PORTAUDIO_INIT_LOCK's docstring. Only the moment of
@@ -180,7 +199,7 @@ class AudioSpectrumAnalyzer(threading.Thread):
         with PORTAUDIO_INIT_LOCK:
             p = pyaudio.PyAudio()
         try:
-            device = self._find_loopback_device(p, pyaudio)
+            device = watcher.current
             if device is None:
                 self._publish_error("Nenhum dispositivo de loopback WASAPI encontrado")
 
@@ -193,13 +212,14 @@ class AudioSpectrumAnalyzer(threading.Thread):
                 if device is None:
                     if self._stop_event.wait(self.cfg.audio_device_poll_s):
                         break
-                    device = self._find_loopback_device(p, pyaudio)
+                    device = watcher.current
                     continue
 
-                device = self._open_and_capture(p, pyaudio, device, master_volume)
+                device = self._open_and_capture(p, pyaudio, device, master_volume, watcher)
         except Exception as e:
             self._publish_error(f"Erro no loopback de áudio: {e}")
         finally:
+            watcher.stop()
             with PORTAUDIO_INIT_LOCK:
                 try:
                     p.terminate()
@@ -211,7 +231,7 @@ class AudioSpectrumAnalyzer(threading.Thread):
                 except Exception:
                     pass
 
-    def _open_and_capture(self, p, pyaudio, device, master_volume: MasterVolumeReader):
+    def _open_and_capture(self, p, pyaudio, device, master_volume: MasterVolumeReader, watcher: DeviceWatcher):
         """Opens a loopback stream for `device` and captures from it until
         the default output device changes, a read fails, or we're told to
         stop. Always closes the stream it opened (no handle leak on device
@@ -238,10 +258,10 @@ class AudioSpectrumAnalyzer(threading.Thread):
         except Exception as e:
             self._publish_error(f"Erro abrindo dispositivo de áudio: {e}")
             self._stop_event.wait(self.cfg.audio_device_poll_s)
-            return self._find_loopback_device(p, pyaudio)
+            return watcher.current
 
         try:
-            return self._capture_loop(p, pyaudio, stream, device, channels, bin_indices, freq_per_bin, peak_lo, peak_hi, master_volume)
+            return self._capture_loop(p, pyaudio, stream, device, channels, bin_indices, freq_per_bin, peak_lo, peak_hi, master_volume, watcher)
         finally:
             stream.stop_stream()
             stream.close()
@@ -307,18 +327,33 @@ class AudioSpectrumAnalyzer(threading.Thread):
         (a real device on this machine: a headset's "Chat" output endpoint
         that nothing was actively playing through) -- polling
         get_read_available() instead lets us give up and hand control back
-        instead of hanging the capture thread indefinitely. Returns None on
-        timeout or stop, without raising.
+        instead of hanging the capture thread indefinitely.
+
+        Always reads *everything* currently buffered, never just a fixed
+        `n_frames` -- confirmed directly (wall-clock session time vs. a
+        real recording's declared WAV duration) that reading a fixed chunk
+        size silently loses audio: if this loop is delayed past one
+        chunk's time budget for any reason (GIL contention with the 60fps
+        render thread, WMI/COM calls on other threads, real system load),
+        more than `n_frames` piles up in the driver's own ring buffer:
+        reading only `n_frames` back then leaves the surplus behind, and
+        if it isn't drained before the next overflow the driver drops it
+        with no exception and no audible glitch -- the recording just
+        silently skips ahead in time. Returns (raw_bytes, frame_count) or
+        None on timeout/stop.
         """
         deadline = time.time() + timeout_s
-        while stream.get_read_available() < n_frames:
+        while True:
+            available = stream.get_read_available()
+            if available >= n_frames:
+                break
             if self._stop_event.is_set() or time.time() >= deadline:
                 return None
             time.sleep(0.01)
-        return stream.read(n_frames, exception_on_overflow=False)
+        return stream.read(available, exception_on_overflow=False), available
 
     def _capture_loop(self, p, pyaudio, stream, device, channels: int, bin_indices, freq_per_bin: float,
-                       peak_lo: int, peak_hi: int, master_volume: MasterVolumeReader):
+                       peak_lo: int, peak_hi: int, master_volume: MasterVolumeReader, watcher: DeviceWatcher):
         device_name = device["name"]
         sample_rate = int(device["defaultSampleRate"])
         self.current_sample_rate = sample_rate
@@ -328,13 +363,17 @@ class AudioSpectrumAnalyzer(threading.Thread):
         while not self._stop_event.is_set():
             if time.time() >= next_device_check:
                 next_device_check = time.time() + self.cfg.audio_device_poll_s
-                current = self._find_loopback_device(p, pyaudio)
+                # Instant read of DeviceWatcher's own thread, not a fresh
+                # enumeration call here -- see DeviceWatcher's docstring
+                # for why doing the real work inline used to risk stalling
+                # this loop long enough to glitch whatever's capturing.
+                current = watcher.current
                 if current is None or current["name"] != device_name:
                     return current  # tell the caller to reopen against the new default
 
             master_volume.refresh()
             try:
-                raw = self._read_with_timeout(stream, self.fft_size, timeout_s=3.0)
+                result = self._read_with_timeout(stream, self.fft_size, timeout_s=3.0)
             except Exception as e:
                 self._publish_error(f"Erro lendo stream de áudio: {e}")
                 # Don't retry reads on a stream that just failed -- most
@@ -343,7 +382,7 @@ class AudioSpectrumAnalyzer(threading.Thread):
                 # the current default and open a fresh stream against it.
                 return self._find_loopback_device(p, pyaudio)
 
-            if raw is None:
+            if result is None:
                 if self._stop_event.is_set():
                     return None
                 # No data for 3s straight -- most likely this device has no
@@ -354,10 +393,17 @@ class AudioSpectrumAnalyzer(threading.Thread):
                 self._publish_error(f'Sem áudio de "{device_name}" (dispositivo pode estar inativo)')
                 return self._find_loopback_device(p, pyaudio)
 
-            # Same bytes handed to a recorder if REC is active -- no second
-            # capture, no second stream. Any exception in the sink (e.g. a
-            # disk write failure) is the recorder's problem, never ours.
+            raw, frames_read = result
+
+            # Same bytes handed to a recorder if REC is active -- the whole
+            # block, however large, so a delayed loop draining a backlog
+            # never drops audio from the file. No second capture, no second
+            # stream. Any exception in the sink (e.g. a disk write failure)
+            # is the recorder's problem, never ours.
             sink = self._recording_sink
+            if (sink is not None) != self._priority_raised:
+                win_native.set_current_thread_priority(sink is not None)
+                self._priority_raised = sink is not None
             if sink is not None:
                 try:
                     sink(raw, sample_rate, channels)
@@ -368,8 +414,12 @@ class AudioSpectrumAnalyzer(threading.Thread):
             if channels > 1:
                 samples = samples.reshape(-1, channels).mean(axis=1)
 
+            # The meter/FFT only need the most recent fft_size samples --
+            # when a delayed loop reads a bigger backlog than usual, using
+            # the tail (freshest audio) instead of the head keeps the live
+            # visual in sync with "now" instead of falling behind.
             n = min(len(samples), self.fft_size)
-            self._mono_buf[:n] = samples[:n]
+            self._mono_buf[:n] = samples[-n:]
             if n < self.fft_size:
                 self._mono_buf[n:] = 0.0
 

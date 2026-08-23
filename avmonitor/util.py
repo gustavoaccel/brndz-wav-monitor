@@ -59,3 +59,77 @@ def drain_all(q: "queue.Queue") -> list:
         except queue.Empty:
             break
     return items
+
+
+class DeviceWatcher(threading.Thread):
+    """Resolves "what's the current audio device" on its own thread, with
+    its own PyAudio() instance -- completely separate from whatever
+    real-time capture thread is reading a stream at the same time.
+
+    Why this exists: `resolve_fn` (the loopback/input device-picking
+    logic in audio_spectrum.py/audio_io.py) does real OS/COM device
+    enumeration work that isn't free -- measured directly on real
+    hardware at up to ~86ms for the output picker and ~76ms for the input
+    picker, against per-chunk time budgets of ~85ms and ~43ms
+    respectively. Calling that synchronously, inline, in the real-time
+    capture loop's periodic "did the device change?" recheck means that
+    on a slow poll, the *next* stream.read() gets delayed by nearly (or
+    more than) an entire chunk's worth of time -- which risks a real
+    driver-level buffer overflow, audible as choppy/glitchy audio in
+    whatever's being captured/recorded at that exact moment. Confirmed
+    this was happening in the field (both output and mic recordings
+    reported as choppy), not just a theoretical risk.
+
+    The capture thread only ever reads `.current` (a plain attribute --
+    single-reference swap, GIL-atomic, safe to read from another thread
+    without a lock) instead of calling `resolve_fn` itself. `resolve_fn`
+    runs on its own PyAudio() instance rather than sharing the capture
+    thread's, so there's no risk of the two ever contending over the same
+    native handle either.
+    """
+
+    def __init__(self, resolve_fn, poll_s: float):
+        super().__init__(name="DeviceWatcher", daemon=True)
+        self._resolve_fn = resolve_fn
+        self._poll_s = poll_s
+        self._stop_event = threading.Event()
+        self.current = None  # whatever resolve_fn(p, pyaudio) returns; None until the first poll lands
+
+    def stop(self):
+        self._stop_event.set()
+
+    def run(self):
+        try:
+            import pyaudiowpatch as pyaudio
+        except Exception:
+            return
+
+        com_initialized = False
+        try:
+            import comtypes
+            comtypes.CoInitialize()
+            com_initialized = True
+        except Exception:
+            pass
+
+        with PORTAUDIO_INIT_LOCK:
+            p = pyaudio.PyAudio()
+        try:
+            while not self._stop_event.is_set():
+                try:
+                    self.current = self._resolve_fn(p, pyaudio)
+                except Exception:
+                    pass
+                if self._stop_event.wait(self._poll_s):
+                    break
+        finally:
+            with PORTAUDIO_INIT_LOCK:
+                try:
+                    p.terminate()
+                except Exception:
+                    pass
+            if com_initialized:
+                try:
+                    comtypes.CoUninitialize()
+                except Exception:
+                    pass

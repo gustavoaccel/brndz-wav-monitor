@@ -16,9 +16,27 @@ from typing import List, Optional
 
 import numpy as np
 
-from .util import push_latest, PORTAUDIO_INIT_LOCK
+from .util import push_latest, PORTAUDIO_INIT_LOCK, DeviceWatcher
+from . import win_native
 
 _CHUNK = 2048  # ~43ms @ 48kHz => ~23 meter updates/sec, plenty smooth without polling harder than needed
+
+
+def _apply_gain_int16(raw: bytes, gain: float) -> bytes:
+    """Scales a raw int16 PCM buffer by a linear gain factor with a hard
+    clip -- applied once, here, before both the meter math and the
+    recording sink see the data, so the two always agree on what "the
+    signal" is. Clipping (not wrapping) on overflow: a boosted transient
+    that would have exceeded full scale flattens at it instead of
+    wrapping around to a huge sample of the opposite sign, which would
+    sound far worse than a clean clip.
+    """
+    if gain == 1.0:
+        return raw
+    samples = np.frombuffer(raw, dtype=np.int16).astype(np.float32)
+    samples *= gain
+    np.clip(samples, -32768.0, 32767.0, out=samples)
+    return samples.astype(np.int16).tobytes()
 
 
 def _live_default_input_name() -> Optional[str]:
@@ -73,6 +91,13 @@ class AudioIOMonitor(threading.Thread):
         self._clip_active = False
         self._clip_streak = 0
         self._no_data_active = False
+        # Linear gain applied to every raw chunk before the meter or a
+        # recording ever see it -- see Config.mic_boost_db. Computed once
+        # here, not per-chunk.
+        self._boost_gain = 10.0 ** (cfg.mic_boost_db / 20.0)
+        # Same OS-priority-elevation-while-recording pattern as
+        # AudioSpectrumAnalyzer -- see win_native.set_current_thread_priority().
+        self._priority_raised = False
         # Recording hook: main.py points this at a *second*, independent
         # AudioRecorder's write() when mic-REC is active -- deliberately
         # separate from AudioSpectrumAnalyzer's own recording_sink (output),
@@ -84,6 +109,14 @@ class AudioIOMonitor(threading.Thread):
 
     def stop(self):
         self._stop_event.set()
+
+    def set_gain_db(self, gain_db: float):
+        """Live-adjust the mic boost from the UI settings popup (main
+        thread) -- a single float attribute reassignment, GIL-atomic, safe
+        to call while the capture thread is reading `self._boost_gain` on
+        every chunk without a lock (same pattern as DeviceWatcher.current).
+        """
+        self._boost_gain = 10.0 ** (gain_db / 20.0)
 
     def set_recording_sink(self, sink):
         """`sink(raw_bytes, sample_rate, channels)` or None to stop. Called
@@ -119,11 +152,23 @@ class AudioIOMonitor(threading.Thread):
         # See util.PORTAUDIO_INIT_LOCK's docstring: construction/teardown of
         # PyAudio() races with AudioSpectrumAnalyzer's if unguarded. Only the
         # instant of construction/teardown needs the lock, not the session.
+        # Resolves "which input device is current" on its own thread/
+        # PyAudio() instance -- confirmed in the field that doing this
+        # inline, in the real-time capture loop's periodic recheck, could
+        # take up to ~76ms against a ~43ms per-chunk time budget, and
+        # cause real audible glitches in exactly what was being captured/
+        # recorded (the mic recording). See util.DeviceWatcher's docstring.
+        watcher = DeviceWatcher(lambda p, _pyaudio: self._find_input_device(p), self.cfg.audio_device_poll_s)
+        watcher.start()
+        deadline = time.time() + 2.0
+        while watcher.current is None and time.time() < deadline and not self._stop_event.is_set():
+            time.sleep(0.02)
+
         with PORTAUDIO_INIT_LOCK:
             p = pyaudio.PyAudio()
         try:
             while not self._stop_event.is_set():
-                device = self._find_input_device(p)
+                device = watcher.current
                 if device is None:
                     events = []
                     if self._last_device_name is not None:
@@ -135,7 +180,7 @@ class AudioIOMonitor(threading.Thread):
                     continue
 
                 session_started_at = time.time()
-                self._run_session(p, pyaudio, device)
+                self._run_session(p, pyaudio, device, watcher)
                 # A session that ends almost immediately after starting is a
                 # sign of transient contention (WASAPI enumeration still
                 # settling right at startup, GIL contention with the render
@@ -149,6 +194,7 @@ class AudioIOMonitor(threading.Thread):
         except Exception as e:
             self._publish(AudioInputInfo(error=str(e)))
         finally:
+            watcher.stop()
             with PORTAUDIO_INIT_LOCK:
                 try:
                     p.terminate()
@@ -224,7 +270,7 @@ class AudioIOMonitor(threading.Thread):
         except Exception:
             return inputs[0] if inputs else None
 
-    def _run_session(self, p, pyaudio, device):
+    def _run_session(self, p, pyaudio, device, watcher: DeviceWatcher):
         name = device.get("name") or "Entrada desconhecida"
         rate = int(device.get("defaultSampleRate") or 48000)
         channels = max(1, min(2, int(device.get("maxInputChannels") or 1)))
@@ -253,12 +299,17 @@ class AudioIOMonitor(threading.Thread):
             while not self._stop_event.is_set():
                 if time.time() >= next_device_check:
                     next_device_check = time.time() + self.cfg.audio_device_poll_s
-                    current = self._find_input_device(p)
+                    # Instant read of DeviceWatcher's own thread, not a
+                    # fresh enumeration call here -- see DeviceWatcher's
+                    # docstring for why doing the real work inline used to
+                    # risk stalling this loop long enough to glitch the mic
+                    # capture/recording.
+                    current = watcher.current
                     if current is None or current.get("name") != name:
                         return  # outer loop rediscovers/reopens
 
-                raw = self._read_with_timeout(stream, _CHUNK, timeout_s=2.5)
-                if raw is None:
+                result = self._read_with_timeout(stream, _CHUNK, timeout_s=2.5)
+                if result is None:
                     if self._stop_event.is_set():
                         return
                     # Debounced like every other device event here: log
@@ -279,11 +330,19 @@ class AudioIOMonitor(threading.Thread):
                     self._stop_event.wait(self.cfg.audio_device_poll_s)
                     return
 
+                raw, frames_read = result
+
+                if self._boost_gain != 1.0:
+                    raw = _apply_gain_int16(raw, self._boost_gain)
+
                 # Same bytes handed to the mic recorder if mic-REC is
                 # active -- no second capture, no second stream. Any
                 # exception in the sink (e.g. a disk write failure) is the
                 # recorder's problem, never the meter's.
                 sink = self._recording_sink
+                if (sink is not None) != self._priority_raised:
+                    win_native.set_current_thread_priority(sink is not None)
+                    self._priority_raised = sink is not None
                 if sink is not None:
                     try:
                         sink(raw, rate, channels)
@@ -340,9 +399,18 @@ class AudioIOMonitor(threading.Thread):
                 pass
 
     def _read_with_timeout(self, stream, n_frames: int, timeout_s: float):
+        """See the same-named method in audio_spectrum.py -- identical fix,
+        identical reasoning: always drain everything buffered instead of a
+        fixed `n_frames`, or a loop delayed past its time budget silently
+        loses mic audio to the driver's ring buffer overflowing. Returns
+        (raw_bytes, frame_count) or None on timeout/stop.
+        """
         deadline = time.time() + timeout_s
-        while stream.get_read_available() < n_frames:
+        while True:
+            available = stream.get_read_available()
+            if available >= n_frames:
+                break
             if self._stop_event.is_set() or time.time() >= deadline:
                 return None
             time.sleep(0.01)
-        return stream.read(n_frames, exception_on_overflow=False)
+        return stream.read(available, exception_on_overflow=False), available

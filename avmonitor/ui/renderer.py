@@ -44,6 +44,50 @@ _COLOR_STOPS = [
     (1.0, theme.BAR_CLIP),
 ]
 
+# Compact-mode-only alternate EQ palettes, cycled by the "C" button -- the
+# main panel's EQ always stays on _COLOR_STOPS (quente) regardless of this.
+_COMPACT_THEME_ORDER = ["quente", "frio", "medio", "brndz", "neon"]
+_COMPACT_COLOR_STOPS = {
+    "quente": _COLOR_STOPS,  # unchanged default -- dark wine -> gold -> orange -> red
+    "frio": [
+        (0.0, (18, 42, 66)),
+        (0.5, (34, 132, 176)),
+        (0.8, (46, 184, 150)),
+        (1.0, (94, 232, 150)),
+    ],
+    "medio": [
+        (0.0, (44, 24, 68)),
+        (0.5, (108, 58, 168)),
+        (0.8, (158, 78, 198)),
+        (1.0, (208, 108, 220)),
+    ],
+    "brndz": [
+        (0.0, (38, 21, 17)),
+        (0.5, (92, 40, 32)),
+        (0.8, (150, 55, 45)),
+        (1.0, theme.ACCENT),
+    ],
+    # Neon green -> moss yellow, with a hot-pink accent at the very top --
+    # explicitly requested as a more vivid/neon option than the other 4,
+    # which all stay fairly dark/moody even at full brightness.
+    "neon": [
+        (0.0, (24, 46, 18)),
+        (0.5, (70, 235, 55)),
+        (0.8, (175, 220, 40)),
+        (1.0, (255, 55, 180)),
+    ],
+}
+
+
+def _bar_color_themed(v: float, stops):
+    v = max(0.0, min(1.0, v))
+    for (a_pos, a_col), (b_pos, b_col) in zip(stops, stops[1:]):
+        if a_pos <= v <= b_pos:
+            t = 0.0 if b_pos == a_pos else (v - a_pos) / (b_pos - a_pos)
+            return tuple(int(a_col[i] + (b_col[i] - a_col[i]) * t) for i in range(3))
+    return stops[-1][1]
+
+
 _FREQ_LABELS_HZ = [60, 125, 250, 500, 1000, 2000, 4000, 8000, 16000]
 
 _N_SEGMENTS = 28
@@ -166,6 +210,12 @@ class Renderer:
 
         self._watermark_key = None
         self._watermark_surf = None
+
+        # "C" button in compact mode cycles through these -- quente is the
+        # long-standing default look (unchanged unless the user clicks),
+        # the other three are new discrete alternates, not a continuous
+        # picker, to keep this a one-button toggle instead of new UI chrome.
+        self.compact_color_theme = "quente"
 
         self._text_cache = {}
 
@@ -852,18 +902,22 @@ class Renderer:
         label = self._text(self.font_row, label_text, theme.ACCENT)
         surface.blit(label, label.get_rect(center=self.map_network_button_rect.center))
 
-    def draw_audio_settings_popup(self, surface, directory_display, recording_format, detail_display):
+    def draw_audio_settings_popup(self, surface, directory_display, recording_format, detail_display, mic_gain_db):
         """Small modal for the settings button -- directory is browse-only
         (a native folder picker, driven from main.py), not an in-app text
         field, to avoid building text-input editing for one setting.
         `recording_format` is "wav" or "mp3" (drives which pill is
         highlighted); `detail_display` is the sample rate/channels/bit-depth
         (or bitrate) line, precomputed by main.py since it already knows
-        cfg.
-        Returns (browse_button_rect, close_button_rect, wav_rect, mp3_rect).
+        cfg. `mic_gain_db` drives the ÁUDIO I/O mic-boost stepper -- a
+        -/+ pair instead of a drag slider, since a fixed 2dB step is all
+        this needs and a slider would be real extra layout/drag-handling
+        code for no real benefit here.
+        Returns (browse_button_rect, close_button_rect, wav_rect, mp3_rect,
+        mic_gain_minus_rect, mic_gain_plus_rect).
         """
         w, h = surface.get_size()
-        panel = pygame.Rect(0, 0, 380, 216)
+        panel = pygame.Rect(0, 0, 380, 272)
         panel.center = (w // 2, h // 2)
 
         overlay = pygame.Surface((w, h), pygame.SRCALPHA)
@@ -907,8 +961,26 @@ class Renderer:
         y += 36
 
         surface.blit(self._text(self.font_xs, detail_display, theme.TEXT_LABEL), (panel.x + 16, y))
+        y += 26
 
-        return browse_rect, close_rect, wav_rect, mp3_rect
+        surface.blit(self._text(self.font_xs, "GANHO DO MIC", theme.TEXT_LABEL), (panel.x + 16, y))
+        y += 18
+
+        step_size = 28
+        minus_rect = pygame.Rect(panel.x + 16, y, step_size, step_size)
+        plus_rect = pygame.Rect(minus_rect.right + 90, y, step_size, step_size)
+        for step_rect, label in ((minus_rect, "-"), (plus_rect, "+")):
+            pygame.draw.rect(surface, theme.PANEL_BG, step_rect, border_radius=5)
+            pygame.draw.rect(surface, theme.PANEL_BORDER, step_rect, width=1, border_radius=5)
+            step_label = self._text(self.font_row, label, theme.TEXT)
+            surface.blit(step_label, step_label.get_rect(center=step_rect.center))
+
+        gain_text = self._text(self.font_row, f"+{mic_gain_db:.0f} dB", theme.ACCENT)
+        gain_rect = gain_text.get_rect()
+        gain_rect.center = ((minus_rect.right + plus_rect.left) // 2, minus_rect.centery)
+        surface.blit(gain_text, gain_rect)
+
+        return browse_rect, close_rect, wav_rect, mp3_rect, minus_rect, plus_rect
 
     def draw_confirm_popup(self, surface, title, message, yes_label, no_label):
         """Generic small Yes/No modal -- used for "recording is active,
@@ -1251,12 +1323,13 @@ class Renderer:
         gap = 2
         bar_w = (w - gap * (n + 1)) / n
         baseline = h
+        stops = _COMPACT_COLOR_STOPS.get(self.compact_color_theme, _COLOR_STOPS)
 
         for i, v in enumerate(self.smoothed_bands):
             bar_h = max(2, v * h)
             x = gap + i * (bar_w + gap)
             rect = pygame.Rect(int(x), int(baseline - bar_h), max(1, int(bar_w)), int(bar_h))
-            pygame.draw.rect(surface, _bar_color(v), rect)
+            pygame.draw.rect(surface, _bar_color_themed(v, stops), rect)
 
         if not self.spectrum_available:
             msg = self._text(self.font_xs, "sem áudio", theme.CRIT)
@@ -1270,3 +1343,21 @@ class Renderer:
         label = self._text(self.font_md, "x", theme.TEXT)
         surface.blit(label, label.get_rect(center=rect.center))
         return rect
+
+    def draw_compact_theme_button(self, surface, restore_rect):
+        """"C" button next to the compact-mode close button -- cycles
+        compact_color_theme through _COMPACT_THEME_ORDER on each click
+        (main.py handles the click, this only draws). Same visual style
+        as the restore button so the two read as a pair.
+        """
+        size = 22
+        rect = pygame.Rect(restore_rect.right + 4, restore_rect.y, size, size)
+        pygame.draw.rect(surface, theme.PANEL_BG, rect)
+        pygame.draw.rect(surface, theme.PANEL_BORDER, rect, width=1)
+        label = self._text(self.font_md, "C", theme.ACCENT)
+        surface.blit(label, label.get_rect(center=rect.center))
+        return rect
+
+    def cycle_compact_color_theme(self):
+        idx = _COMPACT_THEME_ORDER.index(self.compact_color_theme) if self.compact_color_theme in _COMPACT_THEME_ORDER else 0
+        self.compact_color_theme = _COMPACT_THEME_ORDER[(idx + 1) % len(_COMPACT_THEME_ORDER)]
