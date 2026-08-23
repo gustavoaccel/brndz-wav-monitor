@@ -44,10 +44,11 @@ _COLOR_STOPS = [
     (1.0, theme.BAR_CLIP),
 ]
 
-# Compact-mode-only alternate EQ palettes, cycled by the "C" button -- the
-# main panel's EQ always stays on _COLOR_STOPS (quente) regardless of this.
-_COMPACT_THEME_ORDER = ["quente", "frio", "medio", "brndz", "neon"]
-_COMPACT_COLOR_STOPS = {
+# Alternate EQ palettes, cycled by the "C" button -- available on both the
+# main panel and compact mode, one shared choice (Renderer.eq_color_theme)
+# so switching between the two views never shows a different color.
+_EQ_THEME_ORDER = ["quente", "frio", "medio", "brndz", "neon", "cyberpunk", "radioativo"]
+_EQ_COLOR_STOPS = {
     "quente": _COLOR_STOPS,  # unchanged default -- dark wine -> gold -> orange -> red
     "frio": [
         (0.0, (18, 42, 66)),
@@ -75,6 +76,22 @@ _COMPACT_COLOR_STOPS = {
         (0.5, (70, 235, 55)),
         (0.8, (175, 220, 40)),
         (1.0, (255, 55, 180)),
+    ],
+    # Cyberpunk pink -- deep purple-blue base into hot magenta, capped with
+    # an electric cyan accent at the peak (the classic magenta+cyan pairing
+    # that reads as "cyberpunk"/synthwave rather than just "pink").
+    "cyberpunk": [
+        (0.0, (32, 10, 46)),
+        (0.5, (220, 20, 140)),
+        (0.8, (255, 55, 195)),
+        (1.0, (60, 235, 255)),
+    ],
+    # Radioactive moss yellow-green transitioning into orange-red at the top.
+    "radioativo": [
+        (0.0, (36, 42, 8)),
+        (0.5, (190, 230, 20)),
+        (0.8, (235, 140, 30)),
+        (1.0, (235, 60, 25)),
     ],
 }
 
@@ -211,15 +228,17 @@ class Renderer:
         self._watermark_key = None
         self._watermark_surf = None
 
-        # "C" button in compact mode cycles through these -- quente is the
-        # long-standing default look (unchanged unless the user clicks),
-        # the other three are new discrete alternates, not a continuous
-        # picker, to keep this a one-button toggle instead of new UI chrome.
-        self.compact_color_theme = "quente"
+        # "C" button (main panel header + compact mode) cycles through
+        # these -- quente is the long-standing default look (unchanged
+        # unless the user clicks), the rest are discrete alternates, not a
+        # continuous picker, to keep this a one-button toggle instead of
+        # new UI chrome. One shared choice for both views.
+        self.eq_color_theme = "quente"
 
         self._text_cache = {}
 
         self._row_colors = [_bar_color((seg + 0.5) / _N_SEGMENTS) for seg in range(_N_SEGMENTS)]
+        self._row_colors_theme = "quente"
         self._ladder_key = None
         self._ladder_surf = None
         self._ladder_seg_y = None
@@ -1214,12 +1233,18 @@ class Renderer:
 
     def _get_ladder_texture(self, bar_w: int, max_h: int):
         """Pre-rendered full-height LED ladder for one bar column, cached by
-        (bar_w, max_h). Built once (and again only on resize) instead of up
-        to _N_SEGMENTS pygame.draw.rect calls per bar per frame -- with 24+
-        bands at 60fps that was ~700 rect fills/frame and the single biggest
-        CPU cost in the whole renderer.
+        (bar_w, max_h, theme). Built once (and again only on resize or a
+        theme change via the "C" button) instead of up to _N_SEGMENTS
+        pygame.draw.rect calls per bar per frame -- with 24+ bands at 60fps
+        that was ~700 rect fills/frame and the single biggest CPU cost in
+        the whole renderer.
         """
-        key = (bar_w, max_h)
+        if self.eq_color_theme != self._row_colors_theme:
+            stops = _EQ_COLOR_STOPS.get(self.eq_color_theme, _COLOR_STOPS)
+            self._row_colors = [_bar_color_themed((seg + 0.5) / _N_SEGMENTS, stops) for seg in range(_N_SEGMENTS)]
+            self._row_colors_theme = self.eq_color_theme
+
+        key = (bar_w, max_h, self.eq_color_theme)
         if key == self._ladder_key:
             return self._ladder_surf, self._ladder_seg_y
 
@@ -1323,7 +1348,7 @@ class Renderer:
         gap = 2
         bar_w = (w - gap * (n + 1)) / n
         baseline = h
-        stops = _COMPACT_COLOR_STOPS.get(self.compact_color_theme, _COLOR_STOPS)
+        stops = _EQ_COLOR_STOPS.get(self.eq_color_theme, _COLOR_STOPS)
 
         for i, v in enumerate(self.smoothed_bands):
             bar_h = max(2, v * h)
@@ -1344,20 +1369,18 @@ class Renderer:
         surface.blit(label, label.get_rect(center=rect.center))
         return rect
 
-    def draw_compact_theme_button(self, surface, restore_rect):
-        """"C" button next to the compact-mode close button -- cycles
-        compact_color_theme through _COMPACT_THEME_ORDER on each click
-        (main.py handles the click, this only draws). Same visual style
-        as the restore button so the two read as a pair.
+    def draw_theme_button(self, surface, rect):
+        """"C" button -- used in both the main panel header (next to the
+        status widget) and compact mode (next to the close button). Cycles
+        eq_color_theme through _EQ_THEME_ORDER on click (main.py handles
+        the click, this only draws); caller positions `rect`.
         """
-        size = 22
-        rect = pygame.Rect(restore_rect.right + 4, restore_rect.y, size, size)
         pygame.draw.rect(surface, theme.PANEL_BG, rect)
         pygame.draw.rect(surface, theme.PANEL_BORDER, rect, width=1)
         label = self._text(self.font_md, "C", theme.ACCENT)
         surface.blit(label, label.get_rect(center=rect.center))
         return rect
 
-    def cycle_compact_color_theme(self):
-        idx = _COMPACT_THEME_ORDER.index(self.compact_color_theme) if self.compact_color_theme in _COMPACT_THEME_ORDER else 0
-        self.compact_color_theme = _COMPACT_THEME_ORDER[(idx + 1) % len(_COMPACT_THEME_ORDER)]
+    def cycle_eq_color_theme(self):
+        idx = _EQ_THEME_ORDER.index(self.eq_color_theme) if self.eq_color_theme in _EQ_THEME_ORDER else 0
+        self.eq_color_theme = _EQ_THEME_ORDER[(idx + 1) % len(_EQ_THEME_ORDER)]

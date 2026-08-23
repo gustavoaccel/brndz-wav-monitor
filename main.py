@@ -252,7 +252,9 @@ def _compute_live_warn_level(cfg, stats, network, processes, spectrum_available)
 def _draw_status_widget(surface, font_label, font_value, x, y, height, level, uptime_text):
     """Status dot (green=ok/amber=warn/red=crit, click to acknowledge red)
     + "Tempo Online" uptime, filling the header gap between "Saída" and
-    "Modo compacto". Returns dot_rect for click hit-testing.
+    "Modo compacto". Returns (dot_rect, right_edge_x) -- dot_rect for click
+    hit-testing, right_edge_x so a caller can place something right after
+    the widget (the "C" EQ-theme button) without guessing its width.
     """
     color = {"crit": theme.CRIT, "warn": theme.WARN}.get(level, theme.OK)
     dot_r = 7
@@ -268,7 +270,8 @@ def _draw_status_widget(surface, font_label, font_value, x, y, height, level, up
     surface.blit(label_img, (text_x, cy - label_img.get_height() - 1))
     surface.blit(value_img, (text_x, cy + 1))
 
-    return dot_rect
+    right_edge = text_x + max(label_img.get_width(), value_img.get_width())
+    return dot_rect, right_edge
 
 
 def _layout_buttons_right_to_left(window_width, y, *rects):
@@ -457,6 +460,7 @@ def main():
     status_critical_active = False
     status_events_seen = 0
     status_dot_rect = pygame.Rect(0, 0, 0, 0)
+    theme_button_rect = pygame.Rect(0, 0, 0, 0)
 
     compact_mode = False
     normal_window_size = (cfg.window_width, cfg.window_height)
@@ -559,7 +563,7 @@ def main():
                         compact_mode = False
                         screen = _exit_compact_mode(normal_window_size, always_on_top)
                     elif compact_theme_rect.collidepoint(event.pos):
-                        renderer.cycle_compact_color_theme()
+                        renderer.cycle_eq_color_theme()
                     else:
                         # No title bar to drag by -- track the grab offset in
                         # screen coordinates and reposition the window under
@@ -592,6 +596,8 @@ def main():
                     if status_critical_active:
                         status_critical_active = False
                         logger.add_event("Status crítico reconhecido pelo usuário", level="ACTION", source="SYSTEM", event="STATUS_ACK")
+                elif theme_button_rect.collidepoint(event.pos):
+                    renderer.cycle_eq_color_theme()
                 elif COLLAPSE_BUTTON_RECT.collidepoint(event.pos):
                     renderer.toggle_top_collapsed()
                 elif TOPMOST_BUTTON_RECT.collidepoint(event.pos):
@@ -835,7 +841,9 @@ def main():
         if compact_mode:
             renderer.draw_compact(screen, theme.COMPACT_COLORKEY)
             compact_restore_rect = renderer.draw_compact_restore_button(screen)
-            compact_theme_rect = renderer.draw_compact_theme_button(screen, compact_restore_rect)
+            compact_theme_rect = renderer.draw_theme_button(
+                screen, pygame.Rect(compact_restore_rect.right + 4, compact_restore_rect.y, 22, 22)
+            )
         else:
             w, h = screen.get_size()
             content = screen.subsurface((0, HEADER_H, w, max(0, h - HEADER_H)))
@@ -875,12 +883,14 @@ def main():
             emin, esec = divmod(erem, 60)
             uptime_text = f"{eh:02d}:{emin:02d}:{esec:02d}"
             status_x = 10
-            if status_x + 160 < DEVICE_BUTTON_RECT.x:
-                status_dot_rect = _draw_status_widget(
+            if status_x + 190 < DEVICE_BUTTON_RECT.x:
+                status_dot_rect, status_right_edge = _draw_status_widget(
                     screen, renderer.font_label, renderer.font_value, status_x, 6, 32, status_level, uptime_text,
                 )
+                theme_button_rect = renderer.draw_theme_button(screen, pygame.Rect(status_right_edge + 14, 6, 22, 22))
             else:
                 status_dot_rect = pygame.Rect(0, 0, 0, 0)  # window too narrow -- no room, no stale hit target
+                theme_button_rect = pygame.Rect(0, 0, 0, 0)
 
             if device_dropdown_open:
                 _, dropdown_row_rects = _draw_device_dropdown(
