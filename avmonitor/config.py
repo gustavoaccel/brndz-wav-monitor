@@ -88,6 +88,13 @@ class Config:
     # at startup and can't be redirected mid-session.
     log_directory_override: str = ""
 
+    # LUFS alert: when the momentary OUT reading crosses this, the
+    # LOUDNESS panel's bar/number flip to a hard alert color -- a
+    # user-set "don't push it past here" line, separate from the fixed
+    # -23/-16/-14 reference ticks (real broadcast/streaming targets,
+    # never move). Adjustable live via the -/+ stepper in that panel.
+    lufs_alert_threshold: float = -9.0
+
     window_width: int = 1280
     window_height: int = 800
 

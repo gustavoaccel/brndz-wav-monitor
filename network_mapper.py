@@ -5,9 +5,11 @@ main monitor's "Mapear Rede" button (see main.py's --network-map dispatch)
 so it gets its own window without touching pygame's single-window model.
 """
 import queue
+import subprocess
 import sys
 import threading
 import time
+import webbrowser
 from pathlib import Path
 
 import pygame
@@ -93,8 +95,21 @@ def main():
 
     rescan_rect = pygame.Rect(0, 0, 150, 34)
     save_rect = pygame.Rect(0, 0, 170, 34)
+    copy_rect = pygame.Rect(0, 0, 150, 34)
     saved_path = None
     saved_flash_until = 0.0
+
+    selected_ip = None
+    last_click_time = 0.0
+    last_click_row = None
+    copy_flash_until = 0.0
+
+    def copy_to_clipboard(text: str):
+        try:
+            subprocess.run(["clip"], input=text.encode("utf-8"), check=True)
+            return True
+        except Exception:
+            return False
 
     def start_scan():
         nonlocal worker, scanning, progress, hosts, status_msg
@@ -130,6 +145,27 @@ def main():
                     except Exception as e:
                         status_msg = f"Erro ao salvar: {e}"
                     saved_flash_until = time.time() + 4.0
+                elif copy_rect.collidepoint(event.pos) and selected_ip:
+                    if copy_to_clipboard(selected_ip):
+                        copy_flash_until = time.time() + 1.5
+                else:
+                    # Row click: single click selects (enables "Copiar IP"),
+                    # a second click on the *same* row within 400ms opens
+                    # its web UI -- most cameras/PTZ/encoders/switches have
+                    # one, and typing the IP by hand every time is the
+                    # actual friction this is fixing.
+                    content_top_hit = HEADER_H + 30
+                    row_idx = (event.pos[1] - content_top_hit + scroll_y) // ROW_H
+                    if event.pos[1] >= content_top_hit and 0 <= row_idx < len(hosts):
+                        host = hosts[row_idx]
+                        now = time.time()
+                        if last_click_row == row_idx and now - last_click_time < 0.4:
+                            webbrowser.open(f"http://{host.ip}")
+                            last_click_row = None
+                        else:
+                            selected_ip = host.ip
+                            last_click_row = row_idx
+                            last_click_time = now
 
         while True:
             try:
@@ -153,11 +189,14 @@ def main():
         title = font_title.render(f"Mapa de Rede — {prefix}.0/24", True, theme.TEXT)
         screen.blit(title, (16, 12))
 
-        rescan_rect.topleft = (w - 340, 13)
-        save_rect.topleft = (w - 180, 13)
+        rescan_rect.topleft = (w - 500, 13)
+        save_rect.topleft = (w - 340, 13)
+        copy_rect.topleft = (w - 160, 13)
         _draw_button(screen, font_btn, rescan_rect, "Escaneando..." if scanning else "Re-escanear", enabled=not scanning)
         _draw_button(screen, font_btn, save_rect, "Salvar mapa (.md)", enabled=bool(hosts) and not scanning,
                      active=saved_path is not None and time.time() < saved_flash_until)
+        _draw_button(screen, font_btn, copy_rect, "IP copiado!" if time.time() < copy_flash_until else "Copiar IP",
+                     enabled=bool(selected_ip), active=time.time() < copy_flash_until)
 
         if scanning:
             done, total = progress
@@ -198,6 +237,8 @@ def main():
             if is_camera:
                 pygame.draw.rect(screen, theme.PANEL_BG, pygame.Rect(0, y, w, ROW_H))
                 pygame.draw.rect(screen, theme.ACCENT, pygame.Rect(0, y, 4, ROW_H))
+            if host.ip == selected_ip:
+                pygame.draw.rect(screen, theme.PANEL_BORDER, pygame.Rect(0, y, w, ROW_H), width=1)
             screen.blit(font_row.render(host.ip, True, color), (col_ip, y + 3))
             screen.blit(font_row.render(host.hostname[:32], True, color), (col_host, y + 3))
             screen.blit(font_row.render(host.mac, True, color), (col_mac, y + 3))
@@ -212,7 +253,10 @@ def main():
 
         # -- footer ------------------------------------------------------------
         pygame.draw.line(screen, theme.PANEL_BORDER, (0, h - FOOTER_H), (w, h - FOOTER_H))
-        hint = font_sm.render("Linhas em destaque = provável câmera/PTZ (RTSP, VISCA ou nome do host)", True, theme.TEXT_LABEL)
+        hint = font_sm.render(
+            "Clique seleciona (Copiar IP) · clique duplo abre http://IP no navegador · destaque = provável câmera/PTZ",
+            True, theme.TEXT_LABEL,
+        )
         screen.blit(hint, (16, h - FOOTER_H + 16))
 
         pygame.display.flip()

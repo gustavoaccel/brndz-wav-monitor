@@ -243,6 +243,10 @@ class Renderer:
         # new UI chrome. One shared choice for both views.
         self.eq_color_theme = "quente"
 
+        self.lufs_alert_threshold = cfg.lufs_alert_threshold
+        self.lufs_threshold_minus_rect = pygame.Rect(0, 0, 0, 0)
+        self.lufs_threshold_plus_rect = pygame.Rect(0, 0, 0, 0)
+
         self._text_cache = {}
 
         self._row_colors = [_bar_color((seg + 0.5) / _N_SEGMENTS) for seg in range(_N_SEGMENTS)]
@@ -638,50 +642,87 @@ class Renderer:
         if clipping:
             pygame.draw.rect(surface, theme.BAR_CLIP, rect, width=2, border_radius=2)
 
-    # Reference points marked on the LUFS bar -- -18 (a common broadcast
-    # target), -14 (Spotify/YouTube streaming target), -9 (louder/more
-    # aggressive master) -- not a generic every-10dB grid, since these
-    # specific numbers are what a technician actually references.
-    _LUFS_TICKS = (-18.0, -14.0, -9.0)
+    # Real reference points from professional loudness meters (Youlean
+    # Loudness Meter, TC Electronic LM, Nugen VisLM), not arbitrary round
+    # numbers: -23 LUFS is the EBU R128 broadcast target, -16 is Apple
+    # Podcasts/older streaming targets, -14 is the current Spotify/
+    # YouTube/Amazon Music streaming standard.
+    _LUFS_REF_TICKS = ((-23.0, "EBU"), (-16.0, "APPLE"), (-14.0, "STREAM"))
 
-    def _draw_lufs_bar(self, surface, rect, y, lufs):
-        """Momentary-LUFS row under the OUT VU meter, same floor/ceil dB
-        scale as the VU bar above it so the gap between the two visually
-        reads as "how much louder are the peaks than the perceived
-        loudness" (dynamic range/compression at a glance). Fill color
-        follows the current EQ color theme (cycled by the "C" button) --
-        deliberately different from the VU meter above, which always
-        stays on the fixed warm/red gradient for a consistent "red=hot"
-        reading regardless of decoration. Returns the y just below the
-        row, same convention as _draw_io_channel.
+    def _draw_loudness_panel(self, surface, rect, y):
+        """Dedicated LUFS (momentary, ITU-R BS.1770-4) display -- lives in
+        the SISTEMA panel's leftover vertical space below the disk list,
+        given the same visual weight as CPU/RAM/GPU (big number + a real
+        bar with reference ticks), not squeezed next to the OUT VU meter
+        anymore. Bar fill follows the current EQ color theme; a
+        user-adjustable alert threshold (-/+ stepper) flips it to a hard
+        alert color when crossed, flagging "pushed hotter than you said
+        you wanted" -- separate from the fixed reference ticks, which
+        never move. Returns (y, threshold_minus_rect, threshold_plus_rect).
         """
-        label_img = self._text(self.font_xs, f"LUFS {lufs:.0f}" if lufs is not None else "LUFS", theme.TEXT_LABEL)
-        bar_x = rect.x + 12 + label_img.get_width() + 8
-        bar_h = 9
-        bar_rect = pygame.Rect(bar_x, y, max(0, rect.right - 12 - bar_x), bar_h)
-        surface.blit(label_img, (rect.x + 12, y + (bar_h - label_img.get_height()) // 2))
+        empty_rect = pygame.Rect(0, 0, 0, 0)
+        if rect.height - y < 70:
+            return y, empty_rect, empty_rect
 
+        surface.blit(self._text(self.font_label_bold, "LOUDNESS (OUT)", theme.TEXT), (rect.x + 12, y))
+        y += 16
+
+        connected = bool(self.spectrum_available and self.output_level_db is not None)
+        lufs = self._out_lufs_smoothed if connected else None
+        over_threshold = lufs is not None and lufs >= self.lufs_alert_threshold
+        stops = _EQ_COLOR_STOPS.get(self.eq_color_theme, _COLOR_STOPS)
+        active_color = theme.BAR_CLIP if over_threshold else _bar_color_themed(0.65, stops)
+
+        num_text = f"{lufs:.1f} LUFS" if lufs is not None else "-- LUFS"
+        num_img = self._text(self.font_value, num_text, active_color)
+        surface.blit(num_img, (rect.x + 12, y))
+        y += num_img.get_height() + 6
+
+        bar_h = 14
+        bar_rect = pygame.Rect(rect.x + 12, y, rect.width - 24, bar_h)
         pygame.draw.rect(surface, theme.BG, bar_rect, border_radius=2)
         pygame.draw.rect(surface, theme.PANEL_BORDER, bar_rect, width=1, border_radius=2)
         floor_db, ceil_db = self.cfg.eq_floor_db, self.cfg.eq_ceil_db
         span = max(1e-6, ceil_db - floor_db)
         inner = bar_rect.inflate(-2, -2)
-        if lufs is not None and bar_rect.width > 2:
-            stops = _EQ_COLOR_STOPS.get(self.eq_color_theme, _COLOR_STOPS)
-            fill_color = _bar_color_themed(0.65, stops)
+        if lufs is not None and inner.width > 2:
             frac = max(0.0, min(1.0, (lufs - floor_db) / span))
             fill_w = int(inner.width * frac)
             if fill_w > 0:
-                pygame.draw.rect(surface, fill_color, pygame.Rect(inner.x, inner.y, fill_w, inner.height), border_radius=1)
+                pygame.draw.rect(surface, active_color, pygame.Rect(inner.x, inner.y, fill_w, inner.height), border_radius=1)
 
-        for tick_db in self._LUFS_TICKS:
+        for tick_db, _label in self._LUFS_REF_TICKS:
             frac = (tick_db - floor_db) / span
             if not 0.0 <= frac <= 1.0:
                 continue
             x = inner.x + int(inner.width * frac)
-            pygame.draw.line(surface, theme.TEXT, (x, inner.bottom - 3), (x, inner.bottom), width=1)
+            pygame.draw.line(surface, theme.TEXT, (x, inner.bottom - 5), (x, inner.bottom), width=1)
 
-        return y + bar_h + 4
+        thr_frac = (self.lufs_alert_threshold - floor_db) / span
+        if 0.0 <= thr_frac <= 1.0:
+            tx = inner.x + int(inner.width * thr_frac)
+            pygame.draw.line(surface, theme.BAR_CLIP, (tx, inner.y - 3), (tx, inner.bottom + 1), width=2)
+        y += bar_h + 4
+
+        tick_labels = " · ".join(f"{v:.0f} {n}" for v, n in self._LUFS_REF_TICKS)
+        surface.blit(self._text(self.font_xs, self._truncate(self.font_xs, tick_labels, rect.width - 24), theme.TEXT_LABEL), (rect.x + 12, y))
+        y += 16
+
+        thr_text = self._text(self.font_xs, f"ALERTA: {self.lufs_alert_threshold:.0f} LUFS", theme.BAR_CLIP)
+        surface.blit(thr_text, (rect.x + 12, y))
+        y += thr_text.get_height() + 4
+
+        step_size = 18
+        minus_rect = pygame.Rect(rect.x + 12, y, step_size, step_size)
+        plus_rect = pygame.Rect(minus_rect.right + 6, y, step_size, step_size)
+        for step_rect, label in ((minus_rect, "-"), (plus_rect, "+")):
+            pygame.draw.rect(surface, theme.PANEL_BG, step_rect, border_radius=4)
+            pygame.draw.rect(surface, theme.PANEL_BORDER, step_rect, width=1, border_radius=4)
+            step_label = self._text(self.font_row, label, theme.TEXT)
+            surface.blit(step_label, step_label.get_rect(center=step_rect.center))
+        y += step_size + 6
+
+        return y, minus_rect, plus_rect
 
     def _draw_rec_badge(self, surface, rect, active, label_text):
         """REC button: a "[ ● REC ]" lockup after the user's reference
@@ -779,7 +820,6 @@ class Renderer:
             out_connected, "OFFLINE",
             toggle_key="out",
         )
-        y = self._draw_lufs_bar(surface, rect, y, self._out_lufs_smoothed if out_connected else None)
         if out_connected and roomy:
             out_name = self.output_device_name or "-"
             y = self._row(surface, rect, y, "device", self._truncate(self.font_row, out_name, rect.width - 90), theme.TEXT_DIM)
@@ -932,6 +972,9 @@ class Renderer:
                 continue
             color = theme.CRIT if d.free_gb < 10 else theme.WARN if d.free_gb < 50 else theme.TEXT_DIM
             y = self._row(surface, rect, y, d.path, f"{d.free_gb:.0f}GB livres", color)
+
+        y += 8
+        _, self.lufs_threshold_minus_rect, self.lufs_threshold_plus_rect = self._draw_loudness_panel(surface, rect, y)
 
     def _draw_network_panel(self, surface, rect, network, log_events=None):
         self._panel_rect(surface, rect, "REDE")

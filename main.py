@@ -644,6 +644,16 @@ def main():
                     mic_rate = latest_audio_io.input.sample_rate if latest_audio_io else 0
                     mic_channels = latest_audio_io.input.channels if latest_audio_io else 0
                     _toggle_recording(mic_recorder, audio_io_thread, logger, renderer, mic_rate, mic_channels, "MIC")
+                elif event.pos[1] >= HEADER_H and renderer.lufs_threshold_minus_rect.collidepoint(
+                    (event.pos[0], event.pos[1] - HEADER_H)
+                ):
+                    cfg.lufs_alert_threshold = max(-40.0, cfg.lufs_alert_threshold - 1.0)
+                    renderer.lufs_alert_threshold = cfg.lufs_alert_threshold
+                elif event.pos[1] >= HEADER_H and renderer.lufs_threshold_plus_rect.collidepoint(
+                    (event.pos[0], event.pos[1] - HEADER_H)
+                ):
+                    cfg.lufs_alert_threshold = min(0.0, cfg.lufs_alert_threshold + 1.0)
+                    renderer.lufs_alert_threshold = cfg.lufs_alert_threshold
                 elif event.pos[1] >= HEADER_H and renderer.audio_settings_button_rect.collidepoint(
                     (event.pos[0], event.pos[1] - HEADER_H)
                 ):
