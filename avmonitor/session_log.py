@@ -35,6 +35,8 @@ _SUMMARY_LEVELS = ("INFO", "ACTION", "OK", "WARNING", "ERROR", "CRASH", "HANG", 
 
 def resolve_log_dir(cfg) -> "tuple[Path, bool]":
     """Returns (directory, used_fallback)."""
+    if getattr(cfg, "log_directory_override", ""):
+        return Path(cfg.log_directory_override), False
     drive = win_native.find_drive_by_label(cfg.drive_label)
     if drive is not None:
         return drive / cfg.log_subdir, False
@@ -87,24 +89,39 @@ class SessionLogger:
         self._events_writer.writerow(EVENT_CSV_HEADER)
         self._events_file.flush()
 
+        # Set the first time a write to either CSV fails (e.g. the drive
+        # holding self.log_dir got unplugged mid-session) -- log_row() used
+        # to let that exception (PermissionError observed in the field)
+        # propagate straight out of the render loop and crash the whole
+        # app. Debounced to one event, not one per frame.
+        self._log_write_broken = False
+
     def log_row(self, stats: Optional["StatsSnapshot"], network: Optional["NetworkSnapshot"]):
         if stats is None:
             return
         if network is not None:
             self._last_targets = network.targets
 
-        self._writer.writerow([
-            datetime.fromtimestamp(stats.timestamp).isoformat(timespec="seconds"),
-            f"{stats.cpu_percent:.1f}",
-            f"{stats.ram_percent:.1f}",
-            f"{stats.ram_used_mb:.0f}",
-            stats.gpu.available,
-            f"{stats.gpu.util_percent:.1f}" if stats.gpu.available else "",
-            f"{stats.gpu.vram_used_mb:.0f}" if stats.gpu.available else "",
-            _fmt_disks(stats.disks),
-            _fmt_targets(self._last_targets) if self._last_targets else "",
-        ])
-        self._csv_file.flush()
+        try:
+            self._writer.writerow([
+                datetime.fromtimestamp(stats.timestamp).isoformat(timespec="seconds"),
+                f"{stats.cpu_percent:.1f}",
+                f"{stats.ram_percent:.1f}",
+                f"{stats.ram_used_mb:.0f}",
+                stats.gpu.available,
+                f"{stats.gpu.util_percent:.1f}" if stats.gpu.available else "",
+                f"{stats.gpu.vram_used_mb:.0f}" if stats.gpu.available else "",
+                _fmt_disks(stats.disks),
+                _fmt_targets(self._last_targets) if self._last_targets else "",
+            ])
+            self._csv_file.flush()
+        except Exception:
+            if not self._log_write_broken:
+                self._log_write_broken = True
+                self.add_event(
+                    "Não foi possível escrever no CSV de métricas (pasta de destino pode ter sido desconectada) -- monitoramento continua, mas essa sessão perdeu o restante do CSV de métricas",
+                    level="ERROR", source="SYSTEM", event="LOG_WRITE_FAILED",
+                )
 
     def add_event(self, message: str, level: str = "INFO", source: str = "SYSTEM", event: str = "EVENT"):
         now = datetime.now()
@@ -151,6 +168,8 @@ class SessionLogger:
     def close(self) -> Path:
         try:
             self._csv_file.close()
+        except Exception:
+            pass
         finally:
             try:
                 self._events_file.close()
@@ -201,5 +220,22 @@ class SessionLogger:
             lines.append("- Nenhum evento registrado.")
         lines.append("")
 
-        self.summary_path.write_text("\n".join(lines), encoding="utf-8")
-        return self.summary_path
+        text = "\n".join(lines)
+        try:
+            self.summary_path.write_text(text, encoding="utf-8")
+            return self.summary_path
+        except Exception:
+            # log_dir's drive can vanish mid-session (observed in the
+            # field: unplugging the external HD it was on threw
+            # PermissionError here and crashed the app on exit) -- fall
+            # back to the same local directory resolve_log_dir() already
+            # uses when the drive was never found in the first place,
+            # rather than losing the summary/crashing at shutdown.
+            try:
+                fallback_dir = Path(self.cfg.fallback_log_dir)
+                fallback_dir.mkdir(parents=True, exist_ok=True)
+                fallback_path = fallback_dir / self.summary_path.name
+                fallback_path.write_text(text, encoding="utf-8")
+                return fallback_path
+            except Exception:
+                return self.summary_path

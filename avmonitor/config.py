@@ -80,12 +80,25 @@ class Config:
     drive_label: str = "brndz.wav"
     log_subdir: str = "AV_TOOLKIT/07_DOCUMENTATION/Logs_Evento"
     fallback_log_dir: str = str(Path.home() / "Documents" / "AV_Monitor_Logs")
+    # Empty = auto (drive_label -> fallback_log_dir, same as before). Set
+    # via the settings popup's "PASTA DE LOGS" browse button, which also
+    # persists it to config.json -- unlike the other settings-popup
+    # toggles (session-only), this one has to survive to the *next*
+    # launch to be useful at all, since SessionLogger opens its files once
+    # at startup and can't be redirected mid-session.
+    log_directory_override: str = ""
 
     window_width: int = 1280
     window_height: int = 800
 
     def to_dict(self) -> dict:
         return asdict(self)
+
+    def save(self, path: Path) -> None:
+        try:
+            path.write_text(json.dumps(self.to_dict(), indent=2, ensure_ascii=False), encoding="utf-8")
+        except Exception:
+            pass
 
 
 def _merge_json(cfg: Config, path: Path) -> Config:
@@ -112,6 +125,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
     return p
 
 
+def default_config_path() -> Path:
+    # Frozen mode: __file__ resolves inside the onefile temp extraction
+    # dir, not next to the actual .exe -- a config.json placed beside
+    # "brndz.wav Monitor.exe" would silently never be found otherwise.
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent / "config.json"
+    return Path(__file__).resolve().parent.parent / "config.json"
+
+
 def load_config(argv=None) -> Config:
     parser = build_arg_parser()
     args = parser.parse_args(argv)
@@ -121,14 +143,7 @@ def load_config(argv=None) -> Config:
     if args.config:
         cfg = _merge_json(cfg, Path(args.config))
     else:
-        # Frozen mode: __file__ resolves inside the onefile temp extraction
-        # dir, not next to the actual .exe -- a config.json placed beside
-        # "brndz.wav Monitor.exe" would silently never be found otherwise.
-        if getattr(sys, "frozen", False):
-            default_path = Path(sys.executable).resolve().parent / "config.json"
-        else:
-            default_path = Path(__file__).resolve().parent.parent / "config.json"
-        cfg = _merge_json(cfg, default_path)
+        cfg = _merge_json(cfg, default_config_path())
 
     overrides = {
         "ping_targets": args.ping_targets,

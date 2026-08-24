@@ -15,6 +15,7 @@ import numpy as np
 
 from .master_volume import MasterVolumeReader
 from .util import push_latest, PORTAUDIO_INIT_LOCK, DeviceWatcher
+from .lufs import MomentaryLufsMeter
 from . import win_native
 
 
@@ -85,6 +86,7 @@ class SpectrumFrame:
     # loopback capture of the same device.
     output_level_db: Optional[float] = None
     output_peak_db: Optional[float] = None
+    output_lufs: Optional[float] = None
 
 
 def log_band_edges(n_bands: int, fmin: float, fmax: float) -> np.ndarray:
@@ -140,6 +142,7 @@ class AudioSpectrumAnalyzer(threading.Thread):
         # start/stop transition, not every chunk. See
         # win_native.set_current_thread_priority()'s docstring.
         self._priority_raised = False
+        self._lufs_meter = MomentaryLufsMeter()
 
     def stop(self):
         self._stop_event.set()
@@ -432,6 +435,11 @@ class AudioSpectrumAnalyzer(threading.Thread):
             output_level_db = 20.0 * np.log10(max(out_rms, 1e-6))
             output_peak_db = 20.0 * np.log10(max(out_peak, 1e-6))
 
+            # Same raw block, no second capture -- see lufs.py.
+            output_lufs = self._lufs_meter.update(
+                np.frombuffer(raw, dtype=np.int16), channels, sample_rate,
+            )
+
             windowed = self._mono_buf * self._window
             spectrum = np.fft.rfft(windowed)
             # Scaled by the actual OS master volume (see master_volume.py) so
@@ -462,4 +470,5 @@ class AudioSpectrumAnalyzer(threading.Thread):
                 bands=self._band_out.copy(), available=True,
                 peak_freq_hz=peak_freq_hz, peak_db=peak_db, device_name=device_name,
                 output_level_db=output_level_db, output_peak_db=output_peak_db,
+                output_lufs=output_lufs,
             ))

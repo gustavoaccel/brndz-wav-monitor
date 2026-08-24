@@ -115,7 +115,7 @@ _BOTTOM_MARGIN = 20
 _TOP_MARGIN = 18
 
 _TOP_PAD = 8
-_MIN_TOP_H = 267  # tall enough for the Áudio I/O panel's two stacked REC buttons (MIC + OUT/gear)
+_MIN_TOP_H = 285  # tall enough for the Áudio I/O panel's two stacked REC buttons (MIC + OUT/gear) + the LUFS row under OUT
 _MIN_COL_FRAC = 0.12
 _SPLIT_HIT = 10
 
@@ -182,6 +182,7 @@ class Renderer:
         self.output_device_name = None
         self.output_level_db = None
         self.output_peak_db = None
+        self.output_lufs = None
 
         # Smoothed IN/OUT meter values (attack-fast/release-slow, same
         # shape as the EQ bands above) -- the raw snapshots only update at
@@ -196,6 +197,13 @@ class Renderer:
         self._in_peak_smoothed = floor_db
         self._out_level_smoothed = floor_db
         self._out_peak_smoothed = floor_db
+        # LUFS itself already carries a ~400ms EMA from
+        # lufs.MomentaryLufsMeter, but that only updates once per audio
+        # chunk (~85ms) -- this render-frame smoothing is just to keep the
+        # bar's motion as continuous as the other meters at 60fps, same
+        # mechanism, much lighter time constant since the source is
+        # already smooth.
+        self._out_lufs_smoothed = -70.0
         self.vu_in_enabled = True
         self.vu_out_enabled = True
         self.vu_in_toggle_rect = pygame.Rect(0, 0, 0, 0)
@@ -364,6 +372,7 @@ class Renderer:
         self.output_device_name = frame.device_name
         self.output_level_db = frame.output_level_db
         self.output_peak_db = frame.output_peak_db
+        self.output_lufs = frame.output_lufs
 
     def update_audio_io(self, audio_io, dt: float):
         """Advances the smoothed IN/OUT meter values one frame -- must run
@@ -388,6 +397,8 @@ class Renderer:
         out_connected = bool(self.spectrum_available and self.output_level_db is not None)
         self._out_level_smoothed = _step(self._out_level_smoothed, self.output_level_db if out_connected else floor_db)
         self._out_peak_smoothed = _step(self._out_peak_smoothed, self.output_peak_db if out_connected else floor_db)
+        lufs_target = self.output_lufs if (out_connected and self.output_lufs is not None) else -70.0
+        self._out_lufs_smoothed = _step(self._out_lufs_smoothed, lufs_target)
 
     def push_event(self, message: str, severity: str = "warn"):
         self._event_flashes.append({"msg": message, "expire": time.time() + 6.0, "severity": severity})
@@ -627,6 +638,33 @@ class Renderer:
         if clipping:
             pygame.draw.rect(surface, theme.BAR_CLIP, rect, width=2, border_radius=2)
 
+    def _draw_lufs_bar(self, surface, rect, y, lufs):
+        """Thin momentary-LUFS row under the OUT VU meter, same
+        floor/ceil dB scale as the VU bar above it so the gap between the
+        two visually reads as "how much louder are the peaks than the
+        perceived loudness" (dynamic range/compression at a glance) --
+        cyan fill, deliberately not the VU's gold->red gradient, so the
+        two are never mistaken for the same reading. Returns the y just
+        below the row, same convention as _draw_io_channel.
+        """
+        label_img = self._text(self.font_xs, f"LUFS {lufs:.0f}" if lufs is not None else "LUFS", theme.TEXT_LABEL)
+        surface.blit(label_img, (rect.x + 12, y))
+        bar_x = rect.x + 12 + label_img.get_width() + 8
+        bar_rect = pygame.Rect(bar_x, y + 1, max(0, rect.right - 12 - bar_x), label_img.get_height() - 2)
+
+        pygame.draw.rect(surface, theme.BG, bar_rect, border_radius=2)
+        pygame.draw.rect(surface, theme.PANEL_BORDER, bar_rect, width=1, border_radius=2)
+        if lufs is not None and bar_rect.width > 2:
+            floor_db, ceil_db = self.cfg.eq_floor_db, self.cfg.eq_ceil_db
+            span = max(1e-6, ceil_db - floor_db)
+            inner = bar_rect.inflate(-2, -2)
+            frac = max(0.0, min(1.0, (lufs - floor_db) / span))
+            fill_w = int(inner.width * frac)
+            if fill_w > 0:
+                pygame.draw.rect(surface, (70, 200, 220), pygame.Rect(inner.x, inner.y, fill_w, inner.height), border_radius=1)
+
+        return y + label_img.get_height() + 4
+
     def _draw_rec_badge(self, surface, rect, active, label_text):
         """REC button: a "[ ● REC ]" lockup after the user's reference
         image (black brackets/text + red dot), recolored into this app's
@@ -723,6 +761,7 @@ class Renderer:
             out_connected, "OFFLINE",
             toggle_key="out",
         )
+        y = self._draw_lufs_bar(surface, rect, y, self._out_lufs_smoothed if out_connected else None)
         if out_connected and roomy:
             out_name = self.output_device_name or "-"
             y = self._row(surface, rect, y, "device", self._truncate(self.font_row, out_name, rect.width - 90), theme.TEXT_DIM)
@@ -921,7 +960,7 @@ class Renderer:
         label = self._text(self.font_row, label_text, theme.ACCENT)
         surface.blit(label, label.get_rect(center=self.map_network_button_rect.center))
 
-    def draw_audio_settings_popup(self, surface, directory_display, recording_format, detail_display, mic_gain_db):
+    def draw_audio_settings_popup(self, surface, directory_display, recording_format, detail_display, mic_gain_db, log_dir_display):
         """Small modal for the settings button -- directory is browse-only
         (a native folder picker, driven from main.py), not an in-app text
         field, to avoid building text-input editing for one setting.
@@ -931,12 +970,13 @@ class Renderer:
         cfg. `mic_gain_db` drives the ÁUDIO I/O mic-boost stepper -- a
         -/+ pair instead of a drag slider, since a fixed 2dB step is all
         this needs and a slider would be real extra layout/drag-handling
-        code for no real benefit here.
+        code for no real benefit here. `log_dir_display` is the current
+        (or overridden) log destination.
         Returns (browse_button_rect, close_button_rect, wav_rect, mp3_rect,
-        mic_gain_minus_rect, mic_gain_plus_rect).
+        mic_gain_minus_rect, mic_gain_plus_rect, log_browse_rect).
         """
         w, h = surface.get_size()
-        panel = pygame.Rect(0, 0, 380, 272)
+        panel = pygame.Rect(0, 0, 380, 336)
         panel.center = (w // 2, h // 2)
 
         overlay = pygame.Surface((w, h), pygame.SRCALPHA)
@@ -998,8 +1038,24 @@ class Renderer:
         gain_rect = gain_text.get_rect()
         gain_rect.center = ((minus_rect.right + plus_rect.left) // 2, minus_rect.centery)
         surface.blit(gain_text, gain_rect)
+        y += 44
 
-        return browse_rect, close_rect, wav_rect, mp3_rect, minus_rect, plus_rect
+        # Applies from the next launch, not live -- SessionLogger opens its
+        # CSV/events files once at startup, so browsing a new folder here
+        # can't redirect a file handle that's already open. Explained in
+        # the toast main.py shows after picking, not repeated in this UI.
+        surface.blit(self._text(self.font_xs, "PASTA DE LOGS (aplica no próximo início)", theme.TEXT_LABEL), (panel.x + 16, y))
+        y += 16
+        log_text = self._truncate(self.font_row, log_dir_display, panel.width - 32)
+        surface.blit(self._text(self.font_row, log_text, theme.TEXT), (panel.x + 16, y))
+        y += 26
+
+        log_browse_rect = pygame.Rect(panel.x + 16, y, 130, 28)
+        pygame.draw.rect(surface, theme.PANEL_BORDER, log_browse_rect, width=1, border_radius=5)
+        log_browse_label = self._text(self.font_row, "Procurar...", theme.TEXT)
+        surface.blit(log_browse_label, log_browse_label.get_rect(center=log_browse_rect.center))
+
+        return browse_rect, close_rect, wav_rect, mp3_rect, minus_rect, plus_rect, log_browse_rect
 
     def draw_confirm_popup(self, surface, title, message, yes_label, no_label):
         """Generic small Yes/No modal -- used for "recording is active,

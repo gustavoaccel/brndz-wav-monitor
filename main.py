@@ -13,14 +13,14 @@ from pathlib import Path
 
 import pygame
 
-from avmonitor.config import load_config
+from avmonitor.config import load_config, default_config_path
 from avmonitor.audio_spectrum import AudioSpectrumAnalyzer, SpectrumFrame, list_output_devices
 from avmonitor.audio_io import AudioIOMonitor
 from avmonitor.audio_recorder import AudioRecorder, resolve_recording_dir
 from avmonitor.system_stats import SystemStatsMonitor
 from avmonitor.network_monitor import NetworkMonitor
 from avmonitor.process_watch import ProcessWatcher
-from avmonitor.session_log import SessionLogger
+from avmonitor.session_log import SessionLogger, resolve_log_dir
 from avmonitor.ui.renderer import Renderer
 from avmonitor.ui import theme
 from avmonitor.util import drain_all
@@ -481,6 +481,8 @@ def main():
     audio_settings_mp3_rect = pygame.Rect(0, 0, 0, 0)
     audio_settings_gain_minus_rect = pygame.Rect(0, 0, 0, 0)
     audio_settings_gain_plus_rect = pygame.Rect(0, 0, 0, 0)
+    audio_settings_log_browse_rect = pygame.Rect(0, 0, 0, 0)
+    log_folder_browse_queue = None
 
     running = True
     while running:
@@ -554,6 +556,10 @@ def main():
                         cfg.mic_boost_db = min(30.0, cfg.mic_boost_db + 2.0)
                         audio_io_thread.set_gain_db(cfg.mic_boost_db)
                         logger.add_event(f"Ganho do mic: +{cfg.mic_boost_db:.0f}dB", level="INFO", source="RECORDING", event="MIC_GAIN_CHANGED")
+                    elif audio_settings_log_browse_rect.collidepoint(event.pos):
+                        if log_folder_browse_queue is None:
+                            log_dir, _ = resolve_log_dir(cfg)
+                            log_folder_browse_queue = _start_folder_browse(str(log_dir))
                     elif audio_settings_close_rect.collidepoint(event.pos):
                         renderer.audio_settings_open = False
                     else:
@@ -827,6 +833,18 @@ def main():
             except queue.Empty:
                 pass  # picker dialog still open -- keep rendering normally, check again next frame
 
+        if log_folder_browse_queue is not None:
+            try:
+                picked = log_folder_browse_queue.get_nowait()
+                log_folder_browse_queue = None
+                if picked:
+                    cfg.log_directory_override = picked
+                    cfg.save(default_config_path())
+                    logger.add_event(f"Pasta de logs alterada (aplica no próximo início): {picked}", level="INFO", source="SYSTEM", event="LOG_DIR_CHANGED")
+                    renderer.push_event(f"Pasta de logs salva -- aplica no próximo início: {picked}", severity="warn")
+            except queue.Empty:
+                pass
+
         # Status dot: latch red the first time any ERROR/CRASH/HANG-level
         # event lands, from whatever source (audio/network/process/
         # recording) -- scanning the tail of the already-append-only
@@ -903,10 +921,12 @@ def main():
                     detail = f"{cfg.recording_sample_rate / 1000:.1f}kHz · {cfg.recording_channels}ch · 192kbps"
                 else:
                     detail = f"{cfg.recording_sample_rate / 1000:.1f}kHz · {cfg.recording_channels}ch · {cfg.recording_bit_depth}-bit"
+                log_dir, _ = resolve_log_dir(cfg)
                 (audio_settings_browse_rect, audio_settings_close_rect,
                  audio_settings_wav_rect, audio_settings_mp3_rect,
-                 audio_settings_gain_minus_rect, audio_settings_gain_plus_rect) = renderer.draw_audio_settings_popup(
-                    screen, str(directory), cfg.recording_format, detail, cfg.mic_boost_db,
+                 audio_settings_gain_minus_rect, audio_settings_gain_plus_rect,
+                 audio_settings_log_browse_rect) = renderer.draw_audio_settings_popup(
+                    screen, str(directory), cfg.recording_format, detail, cfg.mic_boost_db, str(log_dir),
                 )
 
             if renderer.log_history_open:
