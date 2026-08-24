@@ -417,8 +417,20 @@ class Renderer:
         events_h = 70 if self._event_flashes else 0
         top_h, cols = self._compute_layout(w, h)
         stats_rect = pygame.Rect(0, 0, w, top_h)
-        eq_rect = pygame.Rect(10, top_h + 10, w - 20, h - top_h - events_h - 20)
+        full_eq_rect = pygame.Rect(10, top_h + 10, w - 20, h - top_h - events_h - 20)
         events_rect = pygame.Rect(0, h - events_h, w, events_h)
+
+        # LUFS meter claims a fixed-width strip on the right of the EQ
+        # area, same visual weight as the EQ itself -- only when there's
+        # real room for it, so a narrow/small window just drops it
+        # instead of crushing the EQ down to nothing.
+        lufs_w = 92
+        if full_eq_rect.width > lufs_w * 3:
+            lufs_rect = pygame.Rect(full_eq_rect.right - lufs_w, full_eq_rect.y, lufs_w, full_eq_rect.height)
+            eq_rect = pygame.Rect(full_eq_rect.x, full_eq_rect.y, full_eq_rect.width - lufs_w - 10, full_eq_rect.height)
+        else:
+            lufs_rect = None
+            eq_rect = full_eq_rect
 
         if not self.top_collapsed:
             self._draw_top_panels(surface, stats_rect, cols, stats, network, processes, audio_io, log_events, recording, mic_recording)
@@ -434,6 +446,11 @@ class Renderer:
             self.audio_settings_button_rect = pygame.Rect(0, 0, 0, 0)
         self._draw_split_handles(surface, w, top_h, cols)
         self._draw_spectrum(surface, eq_rect)
+        if lufs_rect is not None:
+            self._draw_loudness_vertical(surface, lufs_rect)
+        else:
+            self.lufs_threshold_minus_rect = pygame.Rect(0, 0, 0, 0)
+            self.lufs_threshold_plus_rect = pygame.Rect(0, 0, 0, 0)
         if events_h:
             self._draw_events(surface, events_rect)
 
@@ -646,26 +663,25 @@ class Renderer:
     # Loudness Meter, TC Electronic LM, Nugen VisLM), not arbitrary round
     # numbers: -23 LUFS is the EBU R128 broadcast target, -16 is Apple
     # Podcasts/older streaming targets, -14 is the current Spotify/
-    # YouTube/Amazon Music streaming standard.
-    _LUFS_REF_TICKS = ((-23.0, "EBU"), (-16.0, "APPLE"), (-14.0, "STREAM"))
+    # YouTube/Amazon Music streaming standard. Drawn as bolder/brighter
+    # ticks than the plain 5-LUFS grid -- no text label in the UI itself
+    # (kept to numbers only, per explicit request), meaning documented
+    # here and in chat instead.
+    _LUFS_REF_TICKS = (-23.0, -16.0, -14.0)
+    _LUFS_GRID = list(range(-60, -4, 5))  # -60, -55, ..., -10, -5
 
-    def _draw_loudness_panel(self, surface, rect, y):
-        """Dedicated LUFS (momentary, ITU-R BS.1770-4) display -- lives in
-        the SISTEMA panel's leftover vertical space below the disk list,
-        given the same visual weight as CPU/RAM/GPU (big number + a real
-        bar with reference ticks), not squeezed next to the OUT VU meter
-        anymore. Bar fill follows the current EQ color theme; a
-        user-adjustable alert threshold (-/+ stepper) flips it to a hard
-        alert color when crossed, flagging "pushed hotter than you said
-        you wanted" -- separate from the fixed reference ticks, which
-        never move. Returns (y, threshold_minus_rect, threshold_plus_rect).
+    def _draw_loudness_vertical(self, surface, rect):
+        """Vertical LUFS (momentary, ITU-R BS.1770-4) meter running the
+        full height of the EQ area, to its right -- same visual weight as
+        the EQ itself, not squeezed into a side panel. Grid ticks every
+        5 LUFS from -60 to -5 (numbers only); bolder ticks single out the
+        real broadcast/streaming reference targets, and a full-width red
+        line marks the user's own adjustable alert threshold. Bar fill
+        follows the current EQ color theme; crossing the alert threshold
+        flips it (and the number) to a hard warning color.
         """
-        empty_rect = pygame.Rect(0, 0, 0, 0)
-        if rect.height - y < 70:
-            return y, empty_rect, empty_rect
-
-        surface.blit(self._text(self.font_label_bold, "LOUDNESS (OUT)", theme.TEXT), (rect.x + 12, y))
-        y += 16
+        pygame.draw.rect(surface, theme.PANEL_BG, rect, border_radius=6)
+        pygame.draw.rect(surface, theme.PANEL_BORDER, rect, width=1, border_radius=6)
 
         connected = bool(self.spectrum_available and self.output_level_db is not None)
         lufs = self._out_lufs_smoothed if connected else None
@@ -673,56 +689,68 @@ class Renderer:
         stops = _EQ_COLOR_STOPS.get(self.eq_color_theme, _COLOR_STOPS)
         active_color = theme.BAR_CLIP if over_threshold else _bar_color_themed(0.65, stops)
 
-        num_text = f"{lufs:.1f} LUFS" if lufs is not None else "-- LUFS"
-        num_img = self._text(self.font_value, num_text, active_color)
-        surface.blit(num_img, (rect.x + 12, y))
-        y += num_img.get_height() + 6
+        title_img = self._text(self.font_xs, "LUFS", theme.TEXT_LABEL)
+        surface.blit(title_img, (rect.centerx - title_img.get_width() // 2, rect.y + 6))
+        num_img = self._text(self.font_row, f"{lufs:.1f}" if lufs is not None else "--", active_color)
+        surface.blit(num_img, (rect.centerx - num_img.get_width() // 2, rect.y + 6 + title_img.get_height() + 2))
 
-        bar_h = 14
-        bar_rect = pygame.Rect(rect.x + 12, y, rect.width - 24, bar_h)
+        step_size = 16
+        stepper_top = rect.bottom - step_size - 6
+        bar_top = rect.y + 6 + title_img.get_height() + 2 + num_img.get_height() + 8
+        bar_bottom = stepper_top - 6
+        bar_w = 14
+        bar_rect = pygame.Rect(rect.x + 8, bar_top, bar_w, max(1, bar_bottom - bar_top))
         pygame.draw.rect(surface, theme.BG, bar_rect, border_radius=2)
         pygame.draw.rect(surface, theme.PANEL_BORDER, bar_rect, width=1, border_radius=2)
+
         floor_db, ceil_db = self.cfg.eq_floor_db, self.cfg.eq_ceil_db
         span = max(1e-6, ceil_db - floor_db)
         inner = bar_rect.inflate(-2, -2)
-        if lufs is not None and inner.width > 2:
-            frac = max(0.0, min(1.0, (lufs - floor_db) / span))
-            fill_w = int(inner.width * frac)
-            if fill_w > 0:
-                pygame.draw.rect(surface, active_color, pygame.Rect(inner.x, inner.y, fill_w, inner.height), border_radius=1)
 
-        for tick_db, _label in self._LUFS_REF_TICKS:
-            frac = (tick_db - floor_db) / span
-            if not 0.0 <= frac <= 1.0:
+        def y_for(db):
+            frac = max(0.0, min(1.0, (db - floor_db) / span))
+            return int(inner.bottom - inner.height * frac)
+
+        if lufs is not None and inner.height > 2:
+            fill_top = y_for(lufs)
+            fill_rect = pygame.Rect(inner.x, fill_top, inner.width, inner.bottom - fill_top)
+            if fill_rect.height > 0:
+                pygame.draw.rect(surface, active_color, fill_rect, border_radius=1)
+
+        for db in self._LUFS_GRID:
+            if db < floor_db or db > ceil_db:
                 continue
-            x = inner.x + int(inner.width * frac)
-            pygame.draw.line(surface, theme.TEXT, (x, inner.bottom - 5), (x, inner.bottom), width=1)
+            # A reference tick within 2 LUFS already shows its own number
+            # right here -- drawing the grid's too would overlap it.
+            near_ref = min((abs(db - ref) for ref in self._LUFS_REF_TICKS), default=99) < 2
+            y = y_for(db)
+            pygame.draw.line(surface, theme.TEXT_LABEL, (inner.right + 2, y), (inner.right + 5, y), width=1)
+            if not near_ref:
+                label = self._text(self.font_xs, str(db), theme.TEXT_LABEL)
+                surface.blit(label, (inner.right + 9, y - label.get_height() // 2))
 
-        thr_frac = (self.lufs_alert_threshold - floor_db) / span
-        if 0.0 <= thr_frac <= 1.0:
-            tx = inner.x + int(inner.width * thr_frac)
-            pygame.draw.line(surface, theme.BAR_CLIP, (tx, inner.y - 3), (tx, inner.bottom + 1), width=2)
-        y += bar_h + 4
+        for ref_db in self._LUFS_REF_TICKS:
+            if ref_db in self._LUFS_GRID or ref_db < floor_db or ref_db > ceil_db:
+                continue
+            y = y_for(ref_db)
+            pygame.draw.line(surface, theme.TEXT, (inner.right + 2, y), (inner.right + 8, y), width=2)
+            label = self._text(self.font_xs, f"{ref_db:.0f}", theme.TEXT)
+            surface.blit(label, (inner.right + 10, y - label.get_height() // 2))
 
-        tick_labels = " · ".join(f"{v:.0f} {n}" for v, n in self._LUFS_REF_TICKS)
-        surface.blit(self._text(self.font_xs, self._truncate(self.font_xs, tick_labels, rect.width - 24), theme.TEXT_LABEL), (rect.x + 12, y))
-        y += 16
+        if floor_db <= self.lufs_alert_threshold <= ceil_db:
+            ty = y_for(self.lufs_alert_threshold)
+            pygame.draw.line(surface, theme.BAR_CLIP, (inner.x - 2, ty), (inner.right + 2, ty), width=2)
 
-        thr_text = self._text(self.font_xs, f"ALERTA: {self.lufs_alert_threshold:.0f} LUFS", theme.BAR_CLIP)
-        surface.blit(thr_text, (rect.x + 12, y))
-        y += thr_text.get_height() + 4
-
-        step_size = 18
-        minus_rect = pygame.Rect(rect.x + 12, y, step_size, step_size)
-        plus_rect = pygame.Rect(minus_rect.right + 6, y, step_size, step_size)
+        minus_rect = pygame.Rect(rect.x + 4, stepper_top, step_size, step_size)
+        plus_rect = pygame.Rect(rect.right - step_size - 4, stepper_top, step_size, step_size)
         for step_rect, label in ((minus_rect, "-"), (plus_rect, "+")):
-            pygame.draw.rect(surface, theme.PANEL_BG, step_rect, border_radius=4)
-            pygame.draw.rect(surface, theme.PANEL_BORDER, step_rect, width=1, border_radius=4)
-            step_label = self._text(self.font_row, label, theme.TEXT)
+            pygame.draw.rect(surface, theme.PANEL_BG, step_rect, border_radius=3)
+            pygame.draw.rect(surface, theme.PANEL_BORDER, step_rect, width=1, border_radius=3)
+            step_label = self._text(self.font_xs, label, theme.TEXT)
             surface.blit(step_label, step_label.get_rect(center=step_rect.center))
-        y += step_size + 6
 
-        return y, minus_rect, plus_rect
+        self.lufs_threshold_minus_rect = minus_rect
+        self.lufs_threshold_plus_rect = plus_rect
 
     def _draw_rec_badge(self, surface, rect, active, label_text):
         """REC button: a "[ ● REC ]" lockup after the user's reference
@@ -972,9 +1000,6 @@ class Renderer:
                 continue
             color = theme.CRIT if d.free_gb < 10 else theme.WARN if d.free_gb < 50 else theme.TEXT_DIM
             y = self._row(surface, rect, y, d.path, f"{d.free_gb:.0f}GB livres", color)
-
-        y += 8
-        _, self.lufs_threshold_minus_rect, self.lufs_threshold_plus_rect = self._draw_loudness_panel(surface, rect, y)
 
     def _draw_network_panel(self, surface, rect, network, log_events=None):
         self._panel_rect(surface, rect, "REDE")
