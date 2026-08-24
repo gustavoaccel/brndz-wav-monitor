@@ -481,7 +481,7 @@ def main():
     audio_settings_mp3_rect = pygame.Rect(0, 0, 0, 0)
     audio_settings_gain_minus_rect = pygame.Rect(0, 0, 0, 0)
     audio_settings_gain_plus_rect = pygame.Rect(0, 0, 0, 0)
-    audio_settings_log_browse_rect = pygame.Rect(0, 0, 0, 0)
+    log_history_browse_rect = pygame.Rect(0, 0, 0, 0)
     log_folder_browse_queue = None
 
     running = True
@@ -531,10 +531,15 @@ def main():
                     elif no_rect.collidepoint(event.pos):
                         confirm_exit_open = False
                 elif renderer.log_history_open:
-                    # Read-only popup -- any click dismisses it (X or
-                    # clicking outside), same catch-all-closes pattern as
-                    # the settings popup.
-                    renderer.log_history_open = False
+                    if log_history_browse_rect.collidepoint(event.pos):
+                        if log_folder_browse_queue is None:
+                            log_dir, _ = resolve_log_dir(cfg)
+                            log_folder_browse_queue = _start_folder_browse(str(log_dir))
+                    else:
+                        # Any other click dismisses it (X or clicking
+                        # outside), same catch-all-closes pattern as the
+                        # settings popup.
+                        renderer.log_history_open = False
                 elif renderer.audio_settings_open:
                     if audio_settings_browse_rect.collidepoint(event.pos):
                         if folder_browse_queue is None:  # ignore a repeat click while one's already open
@@ -556,10 +561,6 @@ def main():
                         cfg.mic_boost_db = min(30.0, cfg.mic_boost_db + 2.0)
                         audio_io_thread.set_gain_db(cfg.mic_boost_db)
                         logger.add_event(f"Ganho do mic: +{cfg.mic_boost_db:.0f}dB", level="INFO", source="RECORDING", event="MIC_GAIN_CHANGED")
-                    elif audio_settings_log_browse_rect.collidepoint(event.pos):
-                        if log_folder_browse_queue is None:
-                            log_dir, _ = resolve_log_dir(cfg)
-                            log_folder_browse_queue = _start_folder_browse(str(log_dir))
                     elif audio_settings_close_rect.collidepoint(event.pos):
                         renderer.audio_settings_open = False
                     else:
@@ -921,16 +922,15 @@ def main():
                     detail = f"{cfg.recording_sample_rate / 1000:.1f}kHz · {cfg.recording_channels}ch · 192kbps"
                 else:
                     detail = f"{cfg.recording_sample_rate / 1000:.1f}kHz · {cfg.recording_channels}ch · {cfg.recording_bit_depth}-bit"
-                log_dir, _ = resolve_log_dir(cfg)
                 (audio_settings_browse_rect, audio_settings_close_rect,
                  audio_settings_wav_rect, audio_settings_mp3_rect,
-                 audio_settings_gain_minus_rect, audio_settings_gain_plus_rect,
-                 audio_settings_log_browse_rect) = renderer.draw_audio_settings_popup(
-                    screen, str(directory), cfg.recording_format, detail, cfg.mic_boost_db, str(log_dir),
+                 audio_settings_gain_minus_rect, audio_settings_gain_plus_rect) = renderer.draw_audio_settings_popup(
+                    screen, str(directory), cfg.recording_format, detail, cfg.mic_boost_db,
                 )
 
             if renderer.log_history_open:
-                renderer.draw_log_history_popup(screen, logger.event_records)
+                log_dir, _ = resolve_log_dir(cfg)
+                _, log_history_browse_rect = renderer.draw_log_history_popup(screen, logger.event_records, str(log_dir))
 
             if confirm_exit_open:
                 renderer.draw_confirm_popup(

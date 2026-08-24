@@ -638,32 +638,50 @@ class Renderer:
         if clipping:
             pygame.draw.rect(surface, theme.BAR_CLIP, rect, width=2, border_radius=2)
 
+    # Reference points marked on the LUFS bar -- -18 (a common broadcast
+    # target), -14 (Spotify/YouTube streaming target), -9 (louder/more
+    # aggressive master) -- not a generic every-10dB grid, since these
+    # specific numbers are what a technician actually references.
+    _LUFS_TICKS = (-18.0, -14.0, -9.0)
+
     def _draw_lufs_bar(self, surface, rect, y, lufs):
-        """Thin momentary-LUFS row under the OUT VU meter, same
-        floor/ceil dB scale as the VU bar above it so the gap between the
-        two visually reads as "how much louder are the peaks than the
-        perceived loudness" (dynamic range/compression at a glance) --
-        cyan fill, deliberately not the VU's gold->red gradient, so the
-        two are never mistaken for the same reading. Returns the y just
-        below the row, same convention as _draw_io_channel.
+        """Momentary-LUFS row under the OUT VU meter, same floor/ceil dB
+        scale as the VU bar above it so the gap between the two visually
+        reads as "how much louder are the peaks than the perceived
+        loudness" (dynamic range/compression at a glance). Fill color
+        follows the current EQ color theme (cycled by the "C" button) --
+        deliberately different from the VU meter above, which always
+        stays on the fixed warm/red gradient for a consistent "red=hot"
+        reading regardless of decoration. Returns the y just below the
+        row, same convention as _draw_io_channel.
         """
         label_img = self._text(self.font_xs, f"LUFS {lufs:.0f}" if lufs is not None else "LUFS", theme.TEXT_LABEL)
-        surface.blit(label_img, (rect.x + 12, y))
         bar_x = rect.x + 12 + label_img.get_width() + 8
-        bar_rect = pygame.Rect(bar_x, y + 1, max(0, rect.right - 12 - bar_x), label_img.get_height() - 2)
+        bar_h = 9
+        bar_rect = pygame.Rect(bar_x, y, max(0, rect.right - 12 - bar_x), bar_h)
+        surface.blit(label_img, (rect.x + 12, y + (bar_h - label_img.get_height()) // 2))
 
         pygame.draw.rect(surface, theme.BG, bar_rect, border_radius=2)
         pygame.draw.rect(surface, theme.PANEL_BORDER, bar_rect, width=1, border_radius=2)
+        floor_db, ceil_db = self.cfg.eq_floor_db, self.cfg.eq_ceil_db
+        span = max(1e-6, ceil_db - floor_db)
+        inner = bar_rect.inflate(-2, -2)
         if lufs is not None and bar_rect.width > 2:
-            floor_db, ceil_db = self.cfg.eq_floor_db, self.cfg.eq_ceil_db
-            span = max(1e-6, ceil_db - floor_db)
-            inner = bar_rect.inflate(-2, -2)
+            stops = _EQ_COLOR_STOPS.get(self.eq_color_theme, _COLOR_STOPS)
+            fill_color = _bar_color_themed(0.65, stops)
             frac = max(0.0, min(1.0, (lufs - floor_db) / span))
             fill_w = int(inner.width * frac)
             if fill_w > 0:
-                pygame.draw.rect(surface, (70, 200, 220), pygame.Rect(inner.x, inner.y, fill_w, inner.height), border_radius=1)
+                pygame.draw.rect(surface, fill_color, pygame.Rect(inner.x, inner.y, fill_w, inner.height), border_radius=1)
 
-        return y + label_img.get_height() + 4
+        for tick_db in self._LUFS_TICKS:
+            frac = (tick_db - floor_db) / span
+            if not 0.0 <= frac <= 1.0:
+                continue
+            x = inner.x + int(inner.width * frac)
+            pygame.draw.line(surface, theme.TEXT, (x, inner.bottom - 3), (x, inner.bottom), width=1)
+
+        return y + bar_h + 4
 
     def _draw_rec_badge(self, surface, rect, active, label_text):
         """REC button: a "[ ● REC ]" lockup after the user's reference
@@ -960,7 +978,7 @@ class Renderer:
         label = self._text(self.font_row, label_text, theme.ACCENT)
         surface.blit(label, label.get_rect(center=self.map_network_button_rect.center))
 
-    def draw_audio_settings_popup(self, surface, directory_display, recording_format, detail_display, mic_gain_db, log_dir_display):
+    def draw_audio_settings_popup(self, surface, directory_display, recording_format, detail_display, mic_gain_db):
         """Small modal for the settings button -- directory is browse-only
         (a native folder picker, driven from main.py), not an in-app text
         field, to avoid building text-input editing for one setting.
@@ -970,13 +988,12 @@ class Renderer:
         cfg. `mic_gain_db` drives the ÁUDIO I/O mic-boost stepper -- a
         -/+ pair instead of a drag slider, since a fixed 2dB step is all
         this needs and a slider would be real extra layout/drag-handling
-        code for no real benefit here. `log_dir_display` is the current
-        (or overridden) log destination.
+        code for no real benefit here.
         Returns (browse_button_rect, close_button_rect, wav_rect, mp3_rect,
-        mic_gain_minus_rect, mic_gain_plus_rect, log_browse_rect).
+        mic_gain_minus_rect, mic_gain_plus_rect).
         """
         w, h = surface.get_size()
-        panel = pygame.Rect(0, 0, 380, 336)
+        panel = pygame.Rect(0, 0, 380, 272)
         panel.center = (w // 2, h // 2)
 
         overlay = pygame.Surface((w, h), pygame.SRCALPHA)
@@ -1038,24 +1055,8 @@ class Renderer:
         gain_rect = gain_text.get_rect()
         gain_rect.center = ((minus_rect.right + plus_rect.left) // 2, minus_rect.centery)
         surface.blit(gain_text, gain_rect)
-        y += 44
 
-        # Applies from the next launch, not live -- SessionLogger opens its
-        # CSV/events files once at startup, so browsing a new folder here
-        # can't redirect a file handle that's already open. Explained in
-        # the toast main.py shows after picking, not repeated in this UI.
-        surface.blit(self._text(self.font_xs, "PASTA DE LOGS (aplica no próximo início)", theme.TEXT_LABEL), (panel.x + 16, y))
-        y += 16
-        log_text = self._truncate(self.font_row, log_dir_display, panel.width - 32)
-        surface.blit(self._text(self.font_row, log_text, theme.TEXT), (panel.x + 16, y))
-        y += 26
-
-        log_browse_rect = pygame.Rect(panel.x + 16, y, 130, 28)
-        pygame.draw.rect(surface, theme.PANEL_BORDER, log_browse_rect, width=1, border_radius=5)
-        log_browse_label = self._text(self.font_row, "Procurar...", theme.TEXT)
-        surface.blit(log_browse_label, log_browse_label.get_rect(center=log_browse_rect.center))
-
-        return browse_rect, close_rect, wav_rect, mp3_rect, minus_rect, plus_rect, log_browse_rect
+        return browse_rect, close_rect, wav_rect, mp3_rect, minus_rect, plus_rect
 
     def draw_confirm_popup(self, surface, title, message, yes_label, no_label):
         """Generic small Yes/No modal -- used for "recording is active,
@@ -1093,13 +1094,17 @@ class Renderer:
 
         return yes_rect, no_rect
 
-    def draw_log_history_popup(self, surface, event_records):
+    def draw_log_history_popup(self, surface, event_records, log_dir_display):
         """Bigger read-only log view for the "clique p/ mais" hint on the
         LOG box -- a quick look at more recent activity without stopping
         the session to open the CSV. Shows the most recent rows that fit
         (no scroll wheel handling, keeping this simple); the full history
         always still goes to the CSV/Markdown report regardless of what's
-        shown here. Returns close_rect.
+        shown here. `log_dir_display` is the current (or overridden) log
+        destination -- this popup is where the "PASTA DE LOGS" browse
+        button lives (moved here from the recording-settings popup: this
+        is "the logs panel," so that's where a log-path setting belongs).
+        Returns (close_rect, log_browse_rect).
         """
         w, h = surface.get_size()
         panel = pygame.Rect(0, 0, min(760, w - 60), min(520, h - 60))
@@ -1124,7 +1129,7 @@ class Renderer:
 
         row_h = 19
         list_top = panel.y + 46
-        list_bottom = panel.bottom - 28
+        list_bottom = panel.bottom - 66  # leaves room for the footer + log-path row below
         max_rows = min(20, max(1, (list_bottom - list_top) // row_h))
 
         events = list(event_records or [])
@@ -1149,9 +1154,23 @@ class Renderer:
 
         footer = f"Mostrando os {len(shown)} mais recentes de {len(events)} — histórico completo no CSV/relatório da sessão"
         footer_img = self._text(self.font_xs, self._truncate(self.font_xs, footer, panel.width - 32), theme.TEXT_LABEL)
-        surface.blit(footer_img, (panel.x + 16, panel.bottom - 20))
+        surface.blit(footer_img, (panel.x + 16, panel.bottom - 44))
 
-        return close_rect
+        pygame.draw.line(surface, theme.PANEL_BORDER, (panel.x + 16, panel.bottom - 34), (panel.right - 16, panel.bottom - 34))
+
+        log_browse_rect = pygame.Rect(panel.right - 16 - 130, panel.bottom - 26, 130, 20)
+        pygame.draw.rect(surface, theme.PANEL_BORDER, log_browse_rect, width=1, border_radius=4)
+        log_browse_label = self._text(self.font_xs, "Alterar pasta...", theme.TEXT)
+        surface.blit(log_browse_label, log_browse_label.get_rect(center=log_browse_rect.center))
+
+        # "aplica no próximo início" -- SessionLogger opens its CSV/events
+        # files once at startup, so browsing a new folder here can't
+        # redirect a handle that's already open (matches the toast
+        # main.py shows after picking).
+        log_label = self._truncate(self.font_xs, f"PASTA DE LOGS: {log_dir_display}", log_browse_rect.x - (panel.x + 16) - 8)
+        surface.blit(self._text(self.font_xs, log_label, theme.TEXT_LABEL), (panel.x + 16, panel.bottom - 24))
+
+        return close_rect, log_browse_rect
 
     def _draw_process_panel(self, surface, rect, stats, processes):
         self._panel_rect(surface, rect, "PROCESSOS")
