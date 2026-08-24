@@ -652,7 +652,11 @@ def main():
                 elif event.pos[1] >= HEADER_H and renderer.lufs_threshold_plus_rect.collidepoint(
                     (event.pos[0], event.pos[1] - HEADER_H)
                 ):
-                    cfg.lufs_alert_threshold = min(0.0, cfg.lufs_alert_threshold + 1.0)
+                    # Capped just under the meter's fixed -9 LUFS full-red
+                    # ceiling -- pushed any higher and the target zone
+                    # between the two would have zero height, hiding the
+                    # marker's whole purpose.
+                    cfg.lufs_alert_threshold = min(-10.0, cfg.lufs_alert_threshold + 1.0)
                     renderer.lufs_alert_threshold = cfg.lufs_alert_threshold
                 elif event.pos[1] >= HEADER_H and renderer.audio_settings_button_rect.collidepoint(
                     (event.pos[0], event.pos[1] - HEADER_H)

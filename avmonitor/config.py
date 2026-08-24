@@ -29,9 +29,16 @@ class Config:
 
     eq_bands: int = 24
     eq_fps: int = 60
-    # 4096 @ 48kHz = ~85ms latency, still imperceptible for a visual meter,
-    # and gives 2x the frequency resolution of 2048 (11.7Hz/bin vs 23.4Hz/bin)
-    eq_fft_size: int = 4096
+    # 2048 @ 48kHz = ~43ms latency (was 4096/~85ms) -- halved after the
+    # user flagged the EQ/VU/LUFS all feeling noticeably behind the real
+    # audio during live monitoring. Frequency resolution drops to
+    # 23.4Hz/bin (was 11.7Hz/bin), which mostly costs precision at the
+    # very bottom of a 24-band log-spaced *visual* display, not
+    # perceptible there. This is the real latency floor everything else
+    # (OUT VU, LUFS) inherits, since they all read off the same capture
+    # chunk -- reducing it here is the actual fix, not just smoothing
+    # tricks downstream.
+    eq_fft_size: int = 2048
     eq_min_freq: float = 40.0
     eq_max_freq: float = 16000.0
     # dBFS-calibrated: 0dB is true digital full scale (see the amplitude
@@ -88,12 +95,18 @@ class Config:
     # at startup and can't be redirected mid-session.
     log_directory_override: str = ""
 
-    # LUFS alert: when the momentary OUT reading crosses this, the
-    # LOUDNESS panel's bar/number flip to a hard alert color -- a
-    # user-set "don't push it past here" line, separate from the fixed
-    # -23/-16/-14 reference ticks (real broadcast/streaming targets,
-    # never move). Adjustable live via the -/+ stepper in that panel.
-    lufs_alert_threshold: float = -9.0
+    # LUFS target: a loudness goal the user sets for the event ("I want
+    # to hit -14 tonight"), not an alert -- once the reading reaches/
+    # passes it, only the part of the LUFS meter's fill above that line
+    # switches to a brighter tone. Separate from the fixed reference
+    # ticks (real broadcast/streaming targets, never move) and from the
+    # meter's own fixed -9 LUFS ceiling, where the *entire* fill always
+    # goes solid red regardless of this value (past that point, almost
+    # certainly compressed/limited). Must stay quieter than -9 for the
+    # target zone between the two to actually show up -- -14 (already a
+    # real streaming reference) is a sensible default. Adjustable live
+    # via the -/+ stepper in the meter.
+    lufs_alert_threshold: float = -14.0
 
     window_width: int = 1280
     window_height: int = 800

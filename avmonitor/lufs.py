@@ -53,9 +53,19 @@ def _biquad(x: np.ndarray, b, a, state: list) -> np.ndarray:
 
 class MomentaryLufsMeter:
     """Feed it the same raw int16 chunk already read for the FFT/recorder
-    -- no second capture. One instance per audio stream (OUT)."""
+    -- no second capture. One instance per audio stream (OUT).
 
-    def __init__(self, tau_s: float = 0.4):
+    `tau_s` defaults to 0.2s, not the ITU spec's literal 400ms Momentary
+    window -- deliberately faster than "by the book" because this is a
+    live field-monitoring meter, not a certified broadcast measurement,
+    and the user explicitly prioritized real-time responsiveness over
+    spec-exactness after finding the reading felt laggy. Combined with
+    the renderer no longer applying its own extra smoothing on top (that
+    was stacking two ~400ms filters into a ~800ms combined lag), this is
+    the other half of that fix.
+    """
+
+    def __init__(self, tau_s: float = 0.2):
         self._pre_state = None
         self._rlb_state = None
         self._ms_ema = None

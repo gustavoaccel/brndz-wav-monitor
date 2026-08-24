@@ -257,6 +257,8 @@ class Renderer:
 
         self._hbar_key = None
         self._hbar_surf = None
+        self._vbar_key = None
+        self._vbar_surf = None
 
     # ---- setup helpers -----------------------------------------------
 
@@ -387,7 +389,12 @@ class Renderer:
         """
         floor_db = self.cfg.eq_floor_db
         attack = 1.0 - math.exp(-dt / 0.03)
-        decay = 1.0 - math.exp(-dt / 0.4)
+        # Was 0.4s (matched a real analog VU meter's ballistics) -- cut to
+        # 0.15s after the user flagged the meters as feeling laggy against
+        # the real audio during live monitoring. Still eases instead of
+        # snapping instantly (avoids a jittery/flickery number), just
+        # settles much faster.
+        decay = 1.0 - math.exp(-dt / 0.15)
 
         def _step(current, target):
             coeff = attack if target > current else decay
@@ -401,8 +408,15 @@ class Renderer:
         out_connected = bool(self.spectrum_available and self.output_level_db is not None)
         self._out_level_smoothed = _step(self._out_level_smoothed, self.output_level_db if out_connected else floor_db)
         self._out_peak_smoothed = _step(self._out_peak_smoothed, self.output_peak_db if out_connected else floor_db)
-        lufs_target = self.output_lufs if (out_connected and self.output_lufs is not None) else -70.0
-        self._out_lufs_smoothed = _step(self._out_lufs_smoothed, lufs_target)
+        # No extra smoothing here, unlike the two above -- LUFS already
+        # comes out of lufs.MomentaryLufsMeter with its own real
+        # time-domain EMA (that's what "momentary" loudness actually is).
+        # Passing it through a second decay filter on top of that was
+        # stacking two ~0.2-0.4s filters into a much laggier combined
+        # response than either alone; this was the main fix for "LUFS
+        # feels the most behind" once the chunk-size latency (see
+        # Config.eq_fft_size) was addressed too.
+        self._out_lufs_smoothed = self.output_lufs if (out_connected and self.output_lufs is not None) else -70.0
 
     def push_event(self, message: str, severity: str = "warn"):
         self._event_flashes.append({"msg": message, "expire": time.time() + 6.0, "severity": severity})
@@ -660,34 +674,70 @@ class Renderer:
             pygame.draw.rect(surface, theme.BAR_CLIP, rect, width=2, border_radius=2)
 
     # Real reference points from professional loudness meters (Youlean
-    # Loudness Meter, TC Electronic LM, Nugen VisLM), not arbitrary round
-    # numbers: -23 LUFS is the EBU R128 broadcast target, -16 is Apple
-    # Podcasts/older streaming targets, -14 is the current Spotify/
-    # YouTube/Amazon Music streaming standard. Drawn as bolder/brighter
-    # ticks than the plain 5-LUFS grid -- no text label in the UI itself
-    # (kept to numbers only, per explicit request), meaning documented
-    # here and in chat instead.
-    _LUFS_REF_TICKS = (-23.0, -16.0, -14.0)
-    _LUFS_GRID = list(range(-60, -4, 5))  # -60, -55, ..., -10, -5
+    # Loudness Meter, TC Electronic LM, Nugen VisLM): -23 LUFS is the
+    # EBU R128 broadcast target, -14 is the current Spotify/YouTube/
+    # Amazon Music streaming standard. -9 is this app's own fixed ceiling
+    # (see _LUFS_RED_DB below), also drawn bold since it's just as much a
+    # real decision point. -19/-17 flank -14 for finer resolution right
+    # around it. Numbers only in the UI -- no text labels (see chat/
+    # CLAUDE.md for what each one means).
+    _LUFS_REF_TICKS = (-23.0, -19.0, -14.0, -9.0)
+    _LUFS_GRID = (-60, -40, -30, -17, -10, -5)
+    # Fixed, not adjustable: at/above this the *entire* fill goes solid
+    # red, all the way down -- past this point the signal is almost
+    # certainly being compressed/limited, worth flagging unmistakably
+    # regardless of where the user's own target marker sits.
+    _LUFS_RED_DB = -9.0
+
+    def _get_vbar_texture(self, w: int, h: int, theme_key: str):
+        """Vertical version of _get_hbar_texture: one pre-rendered
+        low->high gradient strip in the *current* EQ color theme, cached
+        by (size, theme) so a theme change or resize rebuilds it but nothing
+        else does. y=0 (top) is loudest, matching the meter's own layout."""
+        key = (w, h, theme_key)
+        if key == self._vbar_key:
+            return self._vbar_surf
+        w, h = max(1, w), max(1, h)
+        stops = _EQ_COLOR_STOPS.get(theme_key, _COLOR_STOPS)
+        surf = pygame.Surface((w, h), pygame.SRCALPHA)
+        for y in range(h):
+            frac = 1.0 - (y / max(1, h - 1))
+            pygame.draw.line(surf, _bar_color_themed(frac, stops), (0, y), (w - 1, y))
+        self._vbar_surf = surf
+        self._vbar_key = key
+        return surf
 
     def _draw_loudness_vertical(self, surface, rect):
         """Vertical LUFS (momentary, ITU-R BS.1770-4) meter running the
         full height of the EQ area, to its right -- same visual weight as
-        the EQ itself, not squeezed into a side panel. Grid ticks every
-        5 LUFS from -60 to -5 (numbers only); bolder ticks single out the
-        real broadcast/streaming reference targets, and a full-width red
-        line marks the user's own adjustable alert threshold. Bar fill
-        follows the current EQ color theme; crossing the alert threshold
-        flips it (and the number) to a hard warning color.
+        the EQ itself, not squeezed into a side panel. Bar fill is a
+        gradient matching the current EQ color theme (not a flat color).
+
+        Two independent markers, two different meanings:
+        - `lufs_alert_threshold` (wine tick/number, user-adjustable via
+          the -/+ stepper): a loudness *target* for the event ("I want to
+          hit -14 tonight"). Once the reading reaches/passes it, only the
+          part of the fill *above* that line switches to a brighter
+          shade of the same theme -- "you hit your mark," not an alarm.
+        - `_LUFS_RED_DB` (fixed at -9, not adjustable): the ceiling past
+          which the signal is almost certainly being compressed/limited.
+          Crossing it turns the *entire* fill solid red, overriding the
+          target zone entirely -- unmistakable at a glance, since this
+          one is a real problem, not just "past your goal."
         """
         pygame.draw.rect(surface, theme.PANEL_BG, rect, border_radius=6)
         pygame.draw.rect(surface, theme.PANEL_BORDER, rect, width=1, border_radius=6)
 
         connected = bool(self.spectrum_available and self.output_level_db is not None)
         lufs = self._out_lufs_smoothed if connected else None
-        over_threshold = lufs is not None and lufs >= self.lufs_alert_threshold
         stops = _EQ_COLOR_STOPS.get(self.eq_color_theme, _COLOR_STOPS)
-        active_color = theme.BAR_CLIP if over_threshold else _bar_color_themed(0.65, stops)
+        tone_color = _bar_color_themed(0.92, stops)
+        if lufs is not None and lufs >= self._LUFS_RED_DB:
+            active_color = theme.BAR_CLIP
+        elif lufs is not None and lufs >= self.lufs_alert_threshold:
+            active_color = tone_color
+        else:
+            active_color = _bar_color_themed(0.65, stops)
 
         title_img = self._text(self.font_xs, "LUFS", theme.TEXT_LABEL)
         surface.blit(title_img, (rect.centerx - title_img.get_width() // 2, rect.y + 6))
@@ -699,7 +749,7 @@ class Renderer:
         bar_top = rect.y + 6 + title_img.get_height() + 2 + num_img.get_height() + 8
         bar_bottom = stepper_top - 6
         bar_w = 14
-        bar_rect = pygame.Rect(rect.x + 8, bar_top, bar_w, max(1, bar_bottom - bar_top))
+        bar_rect = pygame.Rect(rect.x + 26, bar_top, bar_w, max(1, bar_bottom - bar_top))
         pygame.draw.rect(surface, theme.BG, bar_rect, border_radius=2)
         pygame.draw.rect(surface, theme.PANEL_BORDER, bar_rect, width=1, border_radius=2)
 
@@ -712,16 +762,35 @@ class Renderer:
             return int(inner.bottom - inner.height * frac)
 
         if lufs is not None and inner.height > 2:
-            fill_top = y_for(lufs)
-            fill_rect = pygame.Rect(inner.x, fill_top, inner.width, inner.bottom - fill_top)
-            if fill_rect.height > 0:
-                pygame.draw.rect(surface, active_color, fill_rect, border_radius=1)
+            y_current = y_for(lufs)
+            fill_h = inner.bottom - y_current
+            if fill_h > 0:
+                if lufs >= self._LUFS_RED_DB:
+                    # Past the fixed ceiling: the whole fill goes solid
+                    # red, not just the part above it -- this is a "you're
+                    # almost certainly compressing" flag, not a graded
+                    # warning, so it reads as unmistakable at a glance.
+                    pygame.draw.rect(surface, theme.BAR_CLIP, pygame.Rect(inner.x, y_current, inner.width, fill_h))
+                else:
+                    texture = self._get_vbar_texture(inner.width, inner.height, self.eq_color_theme)
+                    crop = pygame.Rect(0, inner.height - fill_h, inner.width, fill_h)
+                    surface.blit(texture, (inner.x, y_current), area=crop)
+
+                    thr_db = self.lufs_alert_threshold
+                    if lufs >= thr_db:
+                        # Reached/passed the user's own target: only the
+                        # part of the fill *above* the target line
+                        # switches to the brighter tone, not the whole bar
+                        # -- "you hit your mark and kept going," not an
+                        # alert.
+                        y_thr = y_for(thr_db)
+                        tone_rect = pygame.Rect(inner.x, y_current, inner.width, max(0, y_thr - y_current))
+                        if tone_rect.height > 0:
+                            pygame.draw.rect(surface, tone_color, tone_rect)
 
         for db in self._LUFS_GRID:
             if db < floor_db or db > ceil_db:
                 continue
-            # A reference tick within 2 LUFS already shows its own number
-            # right here -- drawing the grid's too would overlap it.
             near_ref = min((abs(db - ref) for ref in self._LUFS_REF_TICKS), default=99) < 2
             y = y_for(db)
             pygame.draw.line(surface, theme.TEXT_LABEL, (inner.right + 2, y), (inner.right + 5, y), width=1)
@@ -730,7 +799,7 @@ class Renderer:
                 surface.blit(label, (inner.right + 9, y - label.get_height() // 2))
 
         for ref_db in self._LUFS_REF_TICKS:
-            if ref_db in self._LUFS_GRID or ref_db < floor_db or ref_db > ceil_db:
+            if ref_db < floor_db or ref_db > ceil_db:
                 continue
             y = y_for(ref_db)
             pygame.draw.line(surface, theme.TEXT, (inner.right + 2, y), (inner.right + 8, y), width=2)
@@ -739,7 +808,11 @@ class Renderer:
 
         if floor_db <= self.lufs_alert_threshold <= ceil_db:
             ty = y_for(self.lufs_alert_threshold)
-            pygame.draw.line(surface, theme.BAR_CLIP, (inner.x - 2, ty), (inner.right + 2, ty), width=2)
+            pygame.draw.line(surface, theme.ACCENT, (inner.x - 2, ty), (inner.right + 2, ty), width=2)
+            thr_label = self._text(self.font_xs, f"{self.lufs_alert_threshold:.0f}", theme.ACCENT)
+            label_x = inner.x - 4 - thr_label.get_width()
+            if label_x >= rect.x:
+                surface.blit(thr_label, (label_x, ty - thr_label.get_height() // 2))
 
         minus_rect = pygame.Rect(rect.x + 4, stepper_top, step_size, step_size)
         plus_rect = pygame.Rect(rect.right - step_size - 4, stepper_top, step_size, step_size)
