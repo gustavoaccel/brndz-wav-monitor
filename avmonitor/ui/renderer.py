@@ -62,11 +62,14 @@ _EQ_COLOR_STOPS = {
         (0.8, (158, 78, 198)),
         (1.0, (208, 108, 220)),
     ],
+    # More aggressive than the other palettes on purpose (user's explicit
+    # ask): red shows up early instead of staying brown until near the
+    # top -- brown base -> crimson/wine by 30% -> scarlet at the peak.
     "brndz": [
-        (0.0, (38, 21, 17)),
-        (0.5, (92, 40, 32)),
-        (0.8, (150, 55, 45)),
-        (1.0, theme.ACCENT),
+        (0.0, (46, 22, 18)),
+        (0.3, (140, 32, 38)),
+        (0.65, (185, 40, 30)),
+        (1.0, (215, 60, 20)),
     ],
     # Neon green -> moss yellow, with a hot-pink accent at the very top --
     # explicitly requested as a more vivid/neon option than the other 4,
@@ -93,6 +96,35 @@ _EQ_COLOR_STOPS = {
         (0.8, (235, 140, 30)),
         (1.0, (235, 60, 25)),
     ],
+}
+
+# Background/panel colors per EQ theme -- (bg, panel_bg, panel_border).
+# "quente" is the original fixed palette, unchanged. Most of the rest
+# lean the dark background toward that theme's own hue instead of one
+# one-size-fits-all warm brown, so a full theme switch reads as "the
+# whole room changed," not just the bar colors. "brndz" is the one
+# genuinely *light* theme in the set (see sync_theme_module(), which also
+# swaps TEXT/TEXT_DIM/TEXT_LABEL/GOLD to dark-on-light for it).
+# Populated lazily on first use by Renderer.sync_theme_module() with the
+# original dark-mode TEXT/TEXT_DIM/TEXT_LABEL/GOLD values, so switching
+# away from "brndz" (the one light theme) can restore them exactly.
+_DARK_TEXT_DEFAULTS = None
+
+_EQ_THEME_BG = {
+    "quente": (theme.BG, theme.PANEL_BG, theme.PANEL_BORDER),
+    "frio": ((14, 18, 24), (21, 27, 35), (40, 55, 68)),
+    "medio": ((19, 15, 24), (29, 23, 35), (56, 43, 66)),
+    # Dark charcoal/slate, not brown or black -- deliberately neutral so
+    # the wine accent (bars, buttons, titles) is the only warm thing on
+    # screen and actually pops, instead of blending into a brown bg the
+    # way it did on the original fixed palette.
+    # Genuinely light -- the one light theme in the set, per the user's
+    # explicit request. Warm off-white/greige, not stark white, so the
+    # wine accent (text/bars/buttons) reads as the star of the palette.
+    "brndz": ((222, 213, 202), (204, 192, 180), (150, 100, 92)),
+    "neon": ((13, 19, 13), (20, 29, 20), (40, 58, 38)),
+    "cyberpunk": ((10, 7, 15), (18, 13, 24), (48, 32, 58)),
+    "radioativo": ((18, 18, 10), (27, 27, 16), (56, 56, 30)),
 }
 
 
@@ -229,6 +261,7 @@ class Renderer:
         self.rec_button_rect = pygame.Rect(0, 0, 0, 0)
         self.mic_rec_button_rect = pygame.Rect(0, 0, 0, 0)
         self.audio_settings_button_rect = pygame.Rect(0, 0, 0, 0)
+        self.mixer_button_rect = pygame.Rect(0, 0, 0, 0)
         self.audio_settings_open = False
         self.log_box_rect = pygame.Rect(0, 0, 0, 0)
         self.log_history_open = False
@@ -425,8 +458,10 @@ class Renderer:
     # ---- drawing ---------------------------------------------------------
 
     def draw(self, surface, stats, network, processes, audio_io=None, log_events=None, recording=None, mic_recording=None):
+        self.sync_theme_module()
         w, h = surface.get_size()
-        surface.fill(theme.BG)
+        bg, _, _ = self.bg_colors()
+        surface.fill(bg)
 
         events_h = 70 if self._event_flashes else 0
         top_h, cols = self._compute_layout(w, h)
@@ -458,6 +493,7 @@ class Renderer:
             self.rec_button_rect = pygame.Rect(0, 0, 0, 0)
             self.mic_rec_button_rect = pygame.Rect(0, 0, 0, 0)
             self.audio_settings_button_rect = pygame.Rect(0, 0, 0, 0)
+            self.mixer_button_rect = pygame.Rect(0, 0, 0, 0)
         self._draw_split_handles(surface, w, top_h, cols)
         self._draw_spectrum(surface, eq_rect)
         if lufs_rect is not None:
@@ -485,6 +521,85 @@ class Renderer:
         color = theme.ACCENT if hot else theme.PANEL_BORDER
         pygame.draw.line(surface, color, (4, top_h), (w - 4, top_h), width=3 if hot else 1)
 
+    def bg_colors(self):
+        """(bg, panel_bg, panel_border) for the current EQ theme -- see
+        _EQ_THEME_BG."""
+        return _EQ_THEME_BG.get(self.eq_color_theme, _EQ_THEME_BG["quente"])
+
+    def sync_theme_module(self):
+        """Mutates theme.py's own "constants" (BG/PANEL_BG/PANEL_BORDER,
+        and TEXT/TEXT_DIM/TEXT_LABEL/GOLD for brndz specifically) to match
+        the current eq_color_theme, every frame. Deliberately a global
+        module mutation rather than routing every one of the hundreds of
+        existing `theme.TEXT`/`theme.PANEL_BG` call sites through a
+        per-instance lookup -- those call sites read the attribute fresh
+        on every draw (Python doesn't cache attribute access), so this is
+        both correct and by far the smallest change that makes every
+        button/panel/popup in the whole app respect the active theme,
+        including brndz being the one genuinely *light* theme in the set
+        (dark wine text on a warm off-white, not just a lighter dark
+        background) -- everything else stays dark-mode with its own hue.
+        Call once at the top of draw()/draw_compact(), before anything
+        else reads a theme.* color this frame.
+        """
+        global _DARK_TEXT_DEFAULTS
+        if _DARK_TEXT_DEFAULTS is None:
+            _DARK_TEXT_DEFAULTS = {
+                "TEXT": theme.TEXT, "TEXT_DIM": theme.TEXT_DIM,
+                "TEXT_LABEL": theme.TEXT_LABEL, "GOLD": theme.GOLD,
+                "OK": theme.OK, "WARN": theme.WARN, "BAR_CLIP": theme.BAR_CLIP,
+            }
+        bg, panel_bg, panel_border = self.bg_colors()
+        theme.BG, theme.PANEL_BG, theme.PANEL_BORDER = bg, panel_bg, panel_border
+        if self.eq_color_theme == "brndz":
+            theme.TEXT = (40, 24, 22)
+            theme.TEXT_DIM = (112, 84, 78)
+            theme.TEXT_LABEL = (148, 120, 112)
+            theme.GOLD = (150, 40, 35)  # crimson, not gold -- gold read poorly here too (e.g. "Tempo Online")
+            # The original light green/orange both washed out against the
+            # warm beige background -- darker, still-recognizable shades
+            # of the same colors, not different hues (green still means
+            # "ok", orange still means "attention"). Tried blue for OK
+            # first; reverted, plain darker green reads more naturally.
+            theme.OK = (28, 118, 58)
+            theme.WARN = (188, 110, 28)
+            # Clipping/"over" goes blue -- not a brighter red, which is
+            # where the rest of this palette already lives -- so it reads
+            # as an unmistakable anomaly against all that red/wine.
+            theme.BAR_CLIP = (30, 130, 220)
+        else:
+            theme.TEXT = _DARK_TEXT_DEFAULTS["TEXT"]
+            theme.TEXT_DIM = _DARK_TEXT_DEFAULTS["TEXT_DIM"]
+            theme.TEXT_LABEL = _DARK_TEXT_DEFAULTS["TEXT_LABEL"]
+            theme.GOLD = _DARK_TEXT_DEFAULTS["GOLD"]
+            theme.OK = _DARK_TEXT_DEFAULTS["OK"]
+            theme.WARN = _DARK_TEXT_DEFAULTS["WARN"]
+            theme.BAR_CLIP = _DARK_TEXT_DEFAULTS["BAR_CLIP"]
+
+    def chrome_accent(self):
+        """Themed wine-family color, used only by event_text_color()'s
+        brndz branch (the bottom-of-EQ log flash text). Titles/buttons/
+        MIXER/watermark were themed with this at one point and reverted
+        per the user's explicit call: only the EQ bars and the LUFS meter
+        follow the color cycle -- everything else, including these,
+        stays fixed wine regardless of theme.
+        """
+        stops = _EQ_COLOR_STOPS.get(self.eq_color_theme, _COLOR_STOPS)
+        return _bar_color_themed(0.62, stops)
+
+    def event_text_color(self, crit: bool):
+        """Color for a log-flash event line (bottom of the EQ area).
+        Critical stays theme.CRIT (fixed red, same "danger" convention as
+        the status dot) always. Non-critical is theme.WARN (yellow) on
+        every dark theme, but that reads poorly on brndz's light beige --
+        crimson instead there, for the same reason GOLD/OK got swapped.
+        """
+        if crit:
+            return theme.CRIT
+        if self.eq_color_theme == "brndz":
+            return self.chrome_accent()
+        return theme.WARN
+
     def _text(self, font, text, color):
         """Cached font.render: the stats/labels barely change between
         stat-poll ticks, so re-rasterizing the same string 60x/sec would
@@ -501,11 +616,12 @@ class Renderer:
         return surf
 
     def _panel_rect(self, surface, rect, title):
-        pygame.draw.rect(surface, theme.PANEL_BG, rect, border_radius=6)
-        pygame.draw.rect(surface, theme.PANEL_BORDER, rect, width=1, border_radius=6)
+        _, panel_bg, panel_border = self.bg_colors()
+        pygame.draw.rect(surface, panel_bg, rect, border_radius=6)
+        pygame.draw.rect(surface, panel_border, rect, width=1, border_radius=6)
         label = self._text(self.font_title, title, theme.PANEL_TITLE)
         surface.blit(label, (rect.x + 12, rect.y + 8))
-        pygame.draw.line(surface, theme.PANEL_BORDER, (rect.x + 12, rect.y + 26), (rect.right - 12, rect.y + 26))
+        pygame.draw.line(surface, panel_border, (rect.x + 12, rect.y + 26), (rect.right - 12, rect.y + 26))
 
     def _truncate(self, font, text, max_w):
         # No room at all -- drop the text rather than draw it full-width,
@@ -625,7 +741,11 @@ class Renderer:
         """Same idea as _get_ladder_texture but horizontal: one pre-rendered
         low->gold->orange->red gradient strip, cached by size, cropped to
         the current level's width each frame instead of drawing gradient
-        pixels every call."""
+        pixels every call. Deliberately NOT themed with the EQ's color
+        cycle (tried it, reverted) -- a level meter's color carries real
+        meaning ("red = hot/near clipping"), and that has to stay
+        consistent no matter what decorative palette is active, or a
+        glance at the meter stops telling you anything reliable."""
         key = (w, h)
         if key == self._hbar_key:
             return self._hbar_surf
@@ -688,6 +808,10 @@ class Renderer:
     # certainly being compressed/limited, worth flagging unmistakably
     # regardless of where the user's own target marker sits.
     _LUFS_RED_DB = -9.0
+    # Compact-mode-only fixed tone-shift point (the main panel uses the
+    # adjustable lufs_alert_threshold marker instead; compact has no room
+    # for its +/- stepper).
+    _LUFS_COMPACT_TONE_DB = -19.0
 
     def _get_vbar_texture(self, w: int, h: int, theme_key: str):
         """Vertical version of _get_hbar_texture: one pre-rendered
@@ -739,7 +863,7 @@ class Renderer:
         else:
             active_color = _bar_color_themed(0.65, stops)
 
-        title_img = self._text(self.font_xs, "LUFS", theme.TEXT_LABEL)
+        title_img = self._text(self.font_xs, "LUFS", theme.OK)
         surface.blit(title_img, (rect.centerx - title_img.get_width() // 2, rect.y + 6))
         num_img = self._text(self.font_row, f"{lufs:.1f}" if lufs is not None else "--", active_color)
         surface.blit(num_img, (rect.centerx - num_img.get_width() // 2, rect.y + 6 + title_img.get_height() + 2))
@@ -894,9 +1018,91 @@ class Renderer:
         pygame.draw.line(surface, outline, (bx - half, by), (bx + half, by), width=2)
         pygame.draw.line(surface, outline, (bx, by - half), (bx, by + half), width=2)
 
+    def _draw_eq_icon(self, surface, rect):
+        """Small EQ-bars glyph, vector primitives -- for the compact-mode
+        toggle button, after the reference image the user sent (a
+        graphic-EQ silhouette)."""
+        heights = (0.35, 0.65, 1.0, 0.5, 0.8)
+        n = len(heights)
+        pad = 3
+        gap = 2
+        bar_w = (rect.width - pad * 2 - gap * (n - 1)) / n
+        base = rect.bottom - pad
+        for i, hfrac in enumerate(heights):
+            bh = max(2, (rect.height - pad * 2) * hfrac)
+            x = rect.x + pad + i * (bar_w + gap)
+            bar_rect = pygame.Rect(int(x), int(base - bh), max(1, int(bar_w)), int(bh))
+            pygame.draw.rect(surface, theme.GOLD, bar_rect, border_radius=1)
+
+    def _draw_lock_icon(self, surface, rect):
+        """Small padlock glyph, vector primitives -- for the
+        always-on-top toggle button, after the reference padlock image."""
+        cx = rect.centerx
+        body_w = rect.width * 0.55
+        body_h = rect.height * 0.4
+        body_rect = pygame.Rect(0, 0, int(body_w), int(body_h))
+        body_rect.midtop = (cx, int(rect.centery))
+        pygame.draw.rect(surface, theme.GOLD, body_rect, border_radius=2)
+        shackle_r = max(2, int(body_w * 0.4))
+        shackle_rect = pygame.Rect(0, 0, shackle_r * 2, shackle_r * 2)
+        shackle_rect.midbottom = (cx, body_rect.top + 2)
+        pygame.draw.arc(surface, theme.GOLD, shackle_rect, 0, math.pi, width=max(2, int(rect.width * 0.14)))
+
+    def _draw_palette_icon(self, surface, rect):
+        """Palette + paint-dots glyph, vector primitives -- replaces the
+        plain "C" letter on the EQ-color-theme-cycle button, after the
+        reference palette/brush image. Dot colors come from the
+        *current* eq_color_theme -- this button literally picks it, so
+        the icon showing that palette's own colors reads as self-
+        explanatory rather than decorative.
+        """
+        stops = _EQ_COLOR_STOPS.get(self.eq_color_theme, _COLOR_STOPS)
+        cx, cy = rect.center
+        r = min(rect.width, rect.height) * 0.36
+        pygame.draw.circle(surface, theme.PANEL_BORDER, (cx, cy), int(r), width=1)
+        dot_positions = ((-0.35, -0.3), (0.15, -0.42), (0.42, 0.0), (0.18, 0.35), (-0.3, 0.3))
+        for i, (dx, dy) in enumerate(dot_positions):
+            frac = i / max(1, len(dot_positions) - 1)
+            color = _bar_color_themed(frac, stops)
+            dot_r = max(1, int(r * 0.32))
+            pygame.draw.circle(surface, color, (int(cx + dx * r), int(cy + dy * r)), dot_r)
+
+    def _draw_hollow_text(self, surface, font, text, pos, outline_color, fill_color):
+        """Outline-only ("vazada") text: no native outline mode in
+        pygame's font renderer, so this fakes it -- render solid in
+        `outline_color` at 8 offsets around the target position (builds
+        a ring), then render once more in `fill_color` dead-center
+        (erases the middle back to the button's own fill, leaving only
+        the ring/edges showing)."""
+        x, y = pos
+        outline_img = font.render(text, True, outline_color)
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                if dx == 0 and dy == 0:
+                    continue
+                surface.blit(outline_img, (x + dx, y + dy))
+        inner_img = font.render(text, True, fill_color)
+        surface.blit(inner_img, (x, y))
+
     def _draw_audio_io_panel(self, surface, rect, audio_io, recording, mic_recording=None):
         self._panel_rect(surface, rect, "ÁUDIO I/O")
+
+        # Settings gear moved up to the title row, right-aligned -- it
+        # used to sit crammed next to REC OUT at the bottom, competing
+        # for space with the record buttons.
+        gear_size = 20
+        self.audio_settings_button_rect = pygame.Rect(rect.right - gear_size - 8, rect.y + 6, gear_size, gear_size)
+        pygame.draw.rect(surface, theme.PANEL_BG, self.audio_settings_button_rect, border_radius=5)
+        pygame.draw.rect(surface, theme.ACCENT, self.audio_settings_button_rect, width=1, border_radius=5)
+        self._draw_gear_plus_icon(
+            surface, self.audio_settings_button_rect.center,
+            min(self.audio_settings_button_rect.width, self.audio_settings_button_rect.height) / 2 - 1,
+        )
+
         y = 34
+        roomy = rect.width >= 150
+        btn_h = 24
+        stops = _EQ_COLOR_STOPS.get(self.eq_color_theme, _COLOR_STOPS)
 
         inp = audio_io.input if audio_io is not None else None
         in_connected = bool(inp is not None and inp.connected)
@@ -907,11 +1113,24 @@ class Renderer:
             bool(inp and inp.clipping), in_connected if inp is not None else None, in_status,
             toggle_key="in",
         )
-        roomy = rect.width >= 150
         if in_connected and roomy:
-            y = self._row(surface, rect, y, "device", self._truncate(self.font_row, inp.name, rect.width - 90), theme.TEXT_DIM)
-            y = self._row(surface, rect, y, "formato", f"{inp.sample_rate / 1000:.1f}kHz · {inp.channels}ch", theme.TEXT_DIM)
-        y += 4
+            in_name = self._truncate(self.font_row, inp.name, rect.width - 24)
+            surface.blit(self._text(self.font_row, in_name, theme.TEXT_DIM), (rect.x + 12, y))
+            y += self.font_row.get_height() + 4
+
+        # REC button lives directly under its own channel now (was two
+        # buttons stacked together at the bottom of the whole panel,
+        # disconnected from which device each one actually belonged to).
+        self.mic_rec_button_rect = pygame.Rect(rect.x + 10, y, rect.width - 20, btn_h)
+        mic_rec_active = bool(mic_recording and mic_recording.active)
+        if mic_rec_active:
+            elapsed = max(0.0, time.time() - mic_recording.started_at)
+            mins, secs = divmod(int(elapsed), 60)
+            mic_rec_text = f"REC IN {mins:02d}:{secs:02d}"
+        else:
+            mic_rec_text = "REC IN"
+        self._draw_rec_badge(surface, self.mic_rec_button_rect, mic_rec_active, mic_rec_text)
+        y += btn_h + 10
 
         out_connected = bool(self.spectrum_available and self.output_level_db is not None)
         out_clipping = bool((self.clip_until > time.time()).any())
@@ -922,35 +1141,11 @@ class Renderer:
             toggle_key="out",
         )
         if out_connected and roomy:
-            out_name = self.output_device_name or "-"
-            y = self._row(surface, rect, y, "device", self._truncate(self.font_row, out_name, rect.width - 90), theme.TEXT_DIM)
+            out_name = self._truncate(self.font_row, self.output_device_name or "-", rect.width - 24)
+            surface.blit(self._text(self.font_row, out_name, theme.TEXT_DIM), (rect.x + 12, y))
+            y += self.font_row.get_height() + 4
 
-        btn_h = 26
-        gear_w = 30
-        gap = 6
-        row_gap = 6
-        out_row_y = rect.bottom - btn_h - 8
-        mic_row_y = out_row_y - row_gap - btn_h
-
-        # Two independent recorders, same button format stacked one above
-        # the other -- REC MIC (input) on top, REC OUT (output/EQ) + the
-        # settings gear on the bottom row. Same _draw_rec_badge for both,
-        # same as every other button in this toolbar (Mapear Rede,
-        # Gerenciador de Tarefas): never mixed into one file, never share
-        # state, only the button chrome is shared.
-        self.mic_rec_button_rect = pygame.Rect(rect.x + 10, mic_row_y, rect.width - 20, btn_h)
-        self.rec_button_rect = pygame.Rect(rect.x + 10, out_row_y, rect.width - 20 - gear_w - gap, btn_h)
-        self.audio_settings_button_rect = pygame.Rect(self.rec_button_rect.right + gap, out_row_y, gear_w, btn_h)
-
-        mic_rec_active = bool(mic_recording and mic_recording.active)
-        if mic_rec_active:
-            elapsed = max(0.0, time.time() - mic_recording.started_at)
-            mins, secs = divmod(int(elapsed), 60)
-            mic_rec_text = f"REC MIC {mins:02d}:{secs:02d}"
-        else:
-            mic_rec_text = "REC MIC"
-        self._draw_rec_badge(surface, self.mic_rec_button_rect, mic_rec_active, mic_rec_text)
-
+        self.rec_button_rect = pygame.Rect(rect.x + 10, y, rect.width - 20, btn_h)
         rec_active = bool(recording and recording.active)
         if rec_active:
             elapsed = max(0.0, time.time() - recording.started_at)
@@ -959,13 +1154,24 @@ class Renderer:
         else:
             rec_text = "REC OUT"
         self._draw_rec_badge(surface, self.rec_button_rect, rec_active, rec_text)
+        y += btn_h + 10
 
-        pygame.draw.rect(surface, theme.PANEL_BG, self.audio_settings_button_rect, border_radius=5)
-        pygame.draw.rect(surface, theme.ACCENT, self.audio_settings_button_rect, width=1, border_radius=5)
-        self._draw_gear_plus_icon(
-            surface, self.audio_settings_button_rect.center,
-            min(self.audio_settings_button_rect.width, self.audio_settings_button_rect.height) / 2 - 1,
-        )
+        # MIXER: placeholder only, no function yet -- just claiming its
+        # spot in the layout for a later session. Filled background +
+        # hollow/outline letters (deliberately different chrome from
+        # every other button here, so it reads as "not live yet" without
+        # needing a text label saying so). Fixed wine, like every other
+        # button -- only the EQ/LUFS meter follow the color theme.
+        mixer_h = 26
+        if y + mixer_h <= rect.bottom - 8:
+            self.mixer_button_rect = pygame.Rect(rect.x + 10, rect.bottom - 8 - mixer_h, rect.width - 20, mixer_h)
+            fill_color = theme.ACCENT
+            pygame.draw.rect(surface, fill_color, self.mixer_button_rect, border_radius=5)
+            label_img_probe = self.font_label_bold.render("MIXER", True, theme.BG)
+            label_pos = label_img_probe.get_rect(center=self.mixer_button_rect.center).topleft
+            self._draw_hollow_text(surface, self.font_label_bold, "MIXER", label_pos, theme.BG, fill_color)
+        else:
+            self.mixer_button_rect = pygame.Rect(0, 0, 0, 0)
 
     def _draw_log_box(self, surface, rect, log_events, bottom_y):
         """Recent-activity strip: a dedicated header row (title + a rule,
@@ -1018,7 +1224,7 @@ class Renderer:
         row_y = box.y + 25
         for event in reversed(events):
             level = event.get("level", "INFO")
-            color = theme.CRIT if level in ("ERROR", "CRASH", "HANG") else theme.WARN if level == "WARNING" else theme.OK if level in ("RECOVERY", "OK") else theme.TEXT_DIM
+            color = theme.CRIT if level in ("ERROR", "CRASH", "HANG") else self.event_text_color(False) if level == "WARNING" else theme.OK if level in ("RECOVERY", "OK") else theme.TEXT_DIM
 
             surface.blit(self._text(self.font_xs, event.get("time", ""), theme.TEXT_LABEL), (box.x + 8, row_y))
             dot_cy = row_y + self.font_xs.get_height() // 2
@@ -1119,29 +1325,30 @@ class Renderer:
         label = self._text(self.font_row, label_text, theme.ACCENT)
         surface.blit(label, label.get_rect(center=self.map_network_button_rect.center))
 
-    def draw_audio_settings_popup(self, surface, directory_display, recording_format, detail_display, mic_gain_db):
+    def draw_audio_settings_popup(self, surface, directory_display, recording_format, detail_display, mic_gain_db, out_gain_db):
         """Small modal for the settings button -- directory is browse-only
         (a native folder picker, driven from main.py), not an in-app text
         field, to avoid building text-input editing for one setting.
         `recording_format` is "wav" or "mp3" (drives which pill is
         highlighted); `detail_display` is the sample rate/channels/bit-depth
         (or bitrate) line, precomputed by main.py since it already knows
-        cfg. `mic_gain_db` drives the ÁUDIO I/O mic-boost stepper -- a
-        -/+ pair instead of a drag slider, since a fixed 2dB step is all
-        this needs and a slider would be real extra layout/drag-handling
+        cfg. `mic_gain_db`/`out_gain_db` drive the mic/OUT boost steppers
+        -- -/+ pairs instead of drag sliders, since a fixed step is all
+        either needs and a slider would be real extra layout/drag-handling
         code for no real benefit here.
         Returns (browse_button_rect, close_button_rect, wav_rect, mp3_rect,
-        mic_gain_minus_rect, mic_gain_plus_rect).
+        mic_gain_minus_rect, mic_gain_plus_rect, out_gain_minus_rect,
+        out_gain_plus_rect).
         """
         w, h = surface.get_size()
-        panel = pygame.Rect(0, 0, 380, 272)
+        panel = pygame.Rect(0, 0, 380, 322)
         panel.center = (w // 2, h // 2)
 
         overlay = pygame.Surface((w, h), pygame.SRCALPHA)
         overlay.fill((0, 0, 0, 120))
         surface.blit(overlay, (0, 0))
 
-        pygame.draw.rect(surface, theme.PANEL_BG, panel, border_radius=8)
+        pygame.draw.rect(surface, self.bg_colors()[1], panel, border_radius=8)
         pygame.draw.rect(surface, theme.ACCENT, panel, width=2, border_radius=8)
 
         title = self._text(self.font_title, "GRAVAÇÃO — CONFIGURAÇÕES", theme.PANEL_TITLE)
@@ -1196,8 +1403,25 @@ class Renderer:
         gain_rect = gain_text.get_rect()
         gain_rect.center = ((minus_rect.right + plus_rect.left) // 2, minus_rect.centery)
         surface.blit(gain_text, gain_rect)
+        y += step_size + 20
 
-        return browse_rect, close_rect, wav_rect, mp3_rect, minus_rect, plus_rect
+        surface.blit(self._text(self.font_xs, "GANHO DO OUT", theme.TEXT_LABEL), (panel.x + 16, y))
+        y += 18
+
+        out_minus_rect = pygame.Rect(panel.x + 16, y, step_size, step_size)
+        out_plus_rect = pygame.Rect(out_minus_rect.right + 90, y, step_size, step_size)
+        for step_rect, label in ((out_minus_rect, "-"), (out_plus_rect, "+")):
+            pygame.draw.rect(surface, theme.PANEL_BG, step_rect, border_radius=5)
+            pygame.draw.rect(surface, theme.PANEL_BORDER, step_rect, width=1, border_radius=5)
+            step_label = self._text(self.font_row, label, theme.TEXT)
+            surface.blit(step_label, step_label.get_rect(center=step_rect.center))
+
+        out_gain_text = self._text(self.font_row, f"{'+' if out_gain_db >= 0 else ''}{out_gain_db:.0f} dB", theme.ACCENT)
+        out_gain_rect = out_gain_text.get_rect()
+        out_gain_rect.center = ((out_minus_rect.right + out_plus_rect.left) // 2, out_minus_rect.centery)
+        surface.blit(out_gain_text, out_gain_rect)
+
+        return browse_rect, close_rect, wav_rect, mp3_rect, minus_rect, plus_rect, out_minus_rect, out_plus_rect
 
     def draw_confirm_popup(self, surface, title, message, yes_label, no_label):
         """Generic small Yes/No modal -- used for "recording is active,
@@ -1212,7 +1436,7 @@ class Renderer:
         overlay.fill((0, 0, 0, 140))
         surface.blit(overlay, (0, 0))
 
-        pygame.draw.rect(surface, theme.PANEL_BG, panel, border_radius=8)
+        pygame.draw.rect(surface, self.bg_colors()[1], panel, border_radius=8)
         pygame.draw.rect(surface, theme.CRIT, panel, width=2, border_radius=8)
 
         surface.blit(self._text(self.font_title, title, theme.CRIT), (panel.x + 16, panel.y + 14))
@@ -1255,7 +1479,7 @@ class Renderer:
         overlay.fill((0, 0, 0, 140))
         surface.blit(overlay, (0, 0))
 
-        pygame.draw.rect(surface, theme.PANEL_BG, panel, border_radius=8)
+        pygame.draw.rect(surface, self.bg_colors()[1], panel, border_radius=8)
         pygame.draw.rect(surface, theme.ACCENT, panel, width=2, border_radius=8)
 
         title = self._text(self.font_title, "HISTÓRICO DE EVENTOS", theme.PANEL_TITLE)
@@ -1282,7 +1506,7 @@ class Renderer:
         y = list_top
         for event in reversed(shown):
             level = event.get("level", "INFO")
-            color = theme.CRIT if level in ("ERROR", "CRASH", "HANG") else theme.WARN if level == "WARNING" else theme.OK if level in ("RECOVERY", "OK") else theme.TEXT_DIM
+            color = theme.CRIT if level in ("ERROR", "CRASH", "HANG") else self.event_text_color(False) if level == "WARNING" else theme.OK if level in ("RECOVERY", "OK") else theme.TEXT_DIM
             surface.blit(self._text(self.font_xs, event.get("time", ""), theme.TEXT_LABEL), (panel.x + 16, y))
             surface.blit(self._text(self.font_xs, level, color), (panel.x + 16 + time_col_w, y))
             msg = self._truncate(self.font_xs, f"[{event.get('source', '')}] {event.get('message', '')}", panel.right - 16 - msg_x)
@@ -1385,6 +1609,9 @@ class Renderer:
             surface.blit(img, (plot.centerx - img.get_width() // 2, plot.centery - img.get_height() // 2))
 
     def _draw_watermark(self, surface, rect):
+        # Fixed wine, not themed -- only the EQ/LUFS meter follow the
+        # color cycle, everything else (including this) stays put.
+        watermark_color = theme.ACCENT
         key = (rect.width, rect.height)
         if key != self._watermark_key:
             size = max(28, int(rect.height * 0.34))
@@ -1394,7 +1621,7 @@ class Renderer:
                     else pygame.font.SysFont("segoe ui", size, bold=True)
             except Exception:
                 font = pygame.font.SysFont("segoe ui", size, bold=True)
-            text_surf = font.render("brndz.wav", True, theme.ACCENT).convert_alpha()
+            text_surf = font.render("brndz.wav", True, watermark_color).convert_alpha()
 
             # Small soundwave glyph under the wordmark -- the same bar
             # heights as brndz_icon.svg's mark (half-heights 0/30/58/24/74/
@@ -1413,7 +1640,7 @@ class Renderer:
                 bh = max(2, int(wave_h * max(0.06, hfrac)))
                 bx = int(i * (bar_w + gap))
                 by = (wave_h - bh) // 2
-                pygame.draw.rect(wave_surf, theme.ACCENT, pygame.Rect(bx, by, bar_w, bh), border_radius=bar_w // 2)
+                pygame.draw.rect(wave_surf, watermark_color, pygame.Rect(bx, by, bar_w, bh), border_radius=bar_w // 2)
 
             combined_h = text_surf.get_height() + 6 + wave_h
             combined_w = max(text_surf.get_width(), wave_w)
@@ -1541,7 +1768,7 @@ class Renderer:
 
         y = rect.y + 6
         for e in self._event_flashes[-3:]:
-            color = theme.CRIT if e["severity"] == "crit" else theme.WARN
+            color = self.event_text_color(e["severity"] == "crit")
             img = self._text(self.font_row, e["msg"], color)
             surface.blit(img, (rect.x + 10, y))
             y += 18
@@ -1555,30 +1782,70 @@ class Renderer:
     # the magic-color background instead of matching it exactly.
 
     def draw_compact(self, surface, colorkey):
+        self.sync_theme_module()
         surface.fill(colorkey)
         n = len(self.smoothed_bands)
         if n == 0:
             return
 
         w, h = surface.get_size()
-        gap = 2
-        bar_w = (w - gap * (n + 1)) / n
-        baseline = h
         stops = _EQ_COLOR_STOPS.get(self.eq_color_theme, _COLOR_STOPS)
+
+        # LUFS VU strip, left edge -- deliberately a *solid* single tone
+        # below -19 (not the EQ bars' own low->high gradient, which the
+        # user found blended into the multicolor EQ bars next to it).
+        # Simplified two-point version of the main panel's target/ceiling
+        # system, since compact mode has no room for the adjustable
+        # marker's +/- stepper: -19 (fixed) is where the fill above it
+        # jumps to a deliberately strong, unmissable tone shift within
+        # the same theme; -9 (fixed, matches the main meter's ceiling)
+        # turns the whole fill scarlet. Only these 2 tick marks, no
+        # numbers -- compact mode stays text-free.
+        lufs_w = 12
+        eq_x0 = lufs_w + 6
+        connected = bool(self.spectrum_available and self.output_level_db is not None)
+        lufs = self._out_lufs_smoothed if connected else None
+        floor_db, ceil_db = self.cfg.eq_floor_db, self.cfg.eq_ceil_db
+        span = max(1e-6, ceil_db - floor_db)
+        if lufs is not None:
+            y_current = int(h - h * max(0.0, min(1.0, (lufs - floor_db) / span)))
+            fill_h = h - y_current
+            if fill_h > 0:
+                if lufs >= self._LUFS_RED_DB:
+                    pygame.draw.rect(surface, theme.BAR_CLIP, pygame.Rect(2, y_current, lufs_w, fill_h))
+                else:
+                    pygame.draw.rect(surface, _bar_color_themed(0.4, stops), pygame.Rect(2, y_current, lufs_w, fill_h))
+                    if lufs >= self._LUFS_COMPACT_TONE_DB:
+                        tone_frac = max(0.0, min(1.0, (self._LUFS_COMPACT_TONE_DB - floor_db) / span))
+                        y_tone = int(h - h * tone_frac)
+                        tone_rect = pygame.Rect(2, y_current, lufs_w, max(0, y_tone - y_current))
+                        if tone_rect.height > 0:
+                            pygame.draw.rect(surface, _bar_color_themed(1.0, stops), tone_rect)
+
+        for ref_db in (self._LUFS_COMPACT_TONE_DB, self._LUFS_RED_DB):
+            if ref_db < floor_db or ref_db > ceil_db:
+                continue
+            ty = int(h - h * max(0.0, min(1.0, (ref_db - floor_db) / span)))
+            pygame.draw.line(surface, theme.TEXT, (2, ty), (2 + lufs_w, ty), width=1)
+
+        gap = 2
+        bar_area_w = w - eq_x0
+        bar_w = (bar_area_w - gap * (n + 1)) / n
+        baseline = h
 
         for i, v in enumerate(self.smoothed_bands):
             bar_h = max(2, v * h)
-            x = gap + i * (bar_w + gap)
+            x = eq_x0 + gap + i * (bar_w + gap)
             rect = pygame.Rect(int(x), int(baseline - bar_h), max(1, int(bar_w)), int(bar_h))
             pygame.draw.rect(surface, _bar_color_themed(v, stops), rect)
 
         if not self.spectrum_available:
             msg = self._text(self.font_xs, "sem áudio", theme.CRIT)
-            surface.blit(msg, (6, 6))
+            surface.blit(msg, (eq_x0 + 4, 6))
 
     def draw_compact_restore_button(self, surface):
-        size = 22
-        rect = pygame.Rect(4, surface.get_height() - size - 4, size, size)
+        size = 20
+        rect = pygame.Rect(1, surface.get_height() - size - 1, size, size)
         pygame.draw.rect(surface, theme.PANEL_BG, rect)
         pygame.draw.rect(surface, theme.PANEL_BORDER, rect, width=1)
         label = self._text(self.font_md, "x", theme.TEXT)
@@ -1593,8 +1860,25 @@ class Renderer:
         """
         pygame.draw.rect(surface, theme.PANEL_BG, rect)
         pygame.draw.rect(surface, theme.PANEL_BORDER, rect, width=1)
-        label = self._text(self.font_md, "C", theme.ACCENT)
-        surface.blit(label, label.get_rect(center=rect.center))
+        self._draw_palette_icon(surface, rect)
+        return rect
+
+    def draw_compact_toggle_icon_button(self, surface, rect):
+        """Small icon button replacing the "Modo compacto" text button --
+        EQ-bars glyph, after the user's reference image."""
+        pygame.draw.rect(surface, theme.PANEL_BG, rect)
+        pygame.draw.rect(surface, theme.PANEL_BORDER, rect, width=1)
+        self._draw_eq_icon(surface, rect)
+        return rect
+
+    def draw_topmost_toggle_icon_button(self, surface, rect, active: bool):
+        """Small icon button replacing the "Sempre no topo" text button --
+        padlock glyph, after the user's reference image. `active`
+        (already pinned) gets the accent border, same convention as
+        every other toggle button in this header."""
+        pygame.draw.rect(surface, theme.PANEL_BG, rect)
+        pygame.draw.rect(surface, theme.ACCENT if active else theme.PANEL_BORDER, rect, width=2 if active else 1)
+        self._draw_lock_icon(surface, rect)
         return rect
 
     def cycle_eq_color_theme(self):

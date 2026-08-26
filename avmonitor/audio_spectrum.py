@@ -16,6 +16,7 @@ import numpy as np
 from .master_volume import MasterVolumeReader
 from .util import push_latest, PORTAUDIO_INIT_LOCK, DeviceWatcher
 from .lufs import MomentaryLufsMeter
+from .audio_io import _apply_gain_int16
 from . import win_native
 
 
@@ -143,6 +144,12 @@ class AudioSpectrumAnalyzer(threading.Thread):
         # win_native.set_current_thread_priority()'s docstring.
         self._priority_raised = False
         self._lufs_meter = MomentaryLufsMeter()
+        # Same idea as AudioIOMonitor's mic boost -- applied before the
+        # recording sink and the meter/FFT so they always agree on the
+        # real level. 0dB (gain 1.0) by default, unlike mic's, since OUT
+        # already has master_volume.scale; this is only for the rare case
+        # of needing extra headroom on top of that.
+        self._out_boost_gain = 10.0 ** (cfg.out_boost_db / 20.0)
 
     def stop(self):
         self._stop_event.set()
@@ -154,6 +161,12 @@ class AudioSpectrumAnalyzer(threading.Thread):
         that's fine, it's a deliberate user choice, not a live meter value.
         """
         self._device_override = loopback_name
+
+    def set_out_gain_db(self, gain_db: float):
+        """Live-adjust the OUT boost from the settings popup -- same
+        GIL-atomic single-attribute-swap pattern as AudioIOMonitor's
+        set_gain_db()."""
+        self._out_boost_gain = 10.0 ** (gain_db / 20.0)
 
     def set_recording_sink(self, sink):
         """`sink(raw_bytes, sample_rate, channels)` or None to stop. Called
@@ -397,6 +410,8 @@ class AudioSpectrumAnalyzer(threading.Thread):
                 return self._find_loopback_device(p, pyaudio)
 
             raw, frames_read = result
+            if self._out_boost_gain != 1.0:
+                raw = _apply_gain_int16(raw, self._out_boost_gain)
 
             # Same bytes handed to a recorder if REC is active -- the whole
             # block, however large, so a delayed loop draining a backlog
@@ -435,9 +450,11 @@ class AudioSpectrumAnalyzer(threading.Thread):
             output_level_db = 20.0 * np.log10(max(out_rms, 1e-6))
             output_peak_db = 20.0 * np.log10(max(out_peak, 1e-6))
 
-            # Same raw block, no second capture -- see lufs.py.
+            # Same raw block, no second capture -- see lufs.py. Same
+            # master_volume.scale as the VU/EQ above, or LUFS would keep
+            # reading the pre-master mix regardless of the OS volume/mute.
             output_lufs = self._lufs_meter.update(
-                np.frombuffer(raw, dtype=np.int16), channels, sample_rate,
+                np.frombuffer(raw, dtype=np.int16), channels, sample_rate, scale=master_volume.scale,
             )
 
             windowed = self._mono_buf * self._window

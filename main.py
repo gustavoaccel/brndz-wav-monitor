@@ -207,12 +207,12 @@ def _truncate_text(font, text, max_w):
     return f"{text}…" if text else "…"
 
 
-def _draw_button(surface, font, rect, text, active=False):
-    color = theme.ACCENT if active else theme.PANEL_BORDER
+def _draw_button(surface, font, rect, text, active=False, accent=theme.ACCENT):
+    color = accent if active else theme.PANEL_BORDER
     pygame.draw.rect(surface, theme.PANEL_BG, rect, border_radius=6)
     pygame.draw.rect(surface, color, rect, width=1 if not active else 2, border_radius=6)
     text = _truncate_text(font, text, rect.width - 16)
-    label = font.render(text, True, theme.TEXT if not active else theme.ACCENT)
+    label = font.render(text, True, theme.TEXT if not active else accent)
     surface.blit(label, label.get_rect(center=rect.center))
 
 
@@ -256,7 +256,12 @@ def _draw_status_widget(surface, font_label, font_value, x, y, height, level, up
     hit-testing, right_edge_x so a caller can place something right after
     the widget (the "C" EQ-theme button) without guessing its width.
     """
-    color = {"crit": theme.CRIT, "warn": theme.WARN}.get(level, theme.OK)
+    # Fixed regardless of the active EQ theme -- green=ok/amber=warn/
+    # red=critical is a universal status convention that has to read the
+    # same no matter which decorative palette is picked (theme.OK gets
+    # overridden to blue for the brndz theme's own text legibility, which
+    # would otherwise leak into this dot and break the convention).
+    color = {"crit": (235, 65, 55), "warn": (235, 160, 50)}.get(level, (80, 210, 120))
     dot_r = 7
     cy = y + height // 2
     dot_rect = pygame.Rect(x, cy - dot_r, dot_r * 2, dot_r * 2)
@@ -282,7 +287,7 @@ def _layout_buttons_right_to_left(window_width, y, *rects):
         x -= 10
 
 
-def _draw_device_dropdown(surface, font, anchor_rect, options, selected_name):
+def _draw_device_dropdown(surface, font, anchor_rect, options, selected_name, accent=theme.ACCENT):
     """options: list of (display, loopback_name). Returns the list of row
     rects in the same order as drawn, for hit-testing -- index 0 is always
     "Automático" (selected_name None), the rest mirror `options`.
@@ -304,7 +309,7 @@ def _draw_device_dropdown(surface, font, anchor_rect, options, selected_name):
         current = name == selected_name
         if hot:
             pygame.draw.rect(surface, theme.PANEL_BORDER, row, border_radius=4)
-        color = theme.ACCENT if current else theme.TEXT
+        color = accent if current else theme.TEXT
         label = font.render(_truncate_text(font, display, row.width - 12), True, color)
         surface.blit(label, (row.x + 8, row.y + (row.height - label.get_height()) // 2))
         y += DEVICE_ROW_H
@@ -353,7 +358,7 @@ def _toggle_recording(recorder, thread, logger, renderer, sample_rate, channels,
     """Shared by both independent recorders -- `recorder`/`thread` is
     either (output AudioRecorder, AudioSpectrumAnalyzer) or (mic
     AudioRecorder, AudioIOMonitor); both thread classes expose the same
-    set_recording_sink(sink_or_None) shape. `label` ("OUT"/"MIC") only
+    set_recording_sink(sink_or_None) shape. `label` ("OUT"/"IN") only
     disambiguates log/toast text -- the two recorders never touch each
     other's state, so they can run at the same time into two separate
     files without any risk of mixing.
@@ -481,6 +486,8 @@ def main():
     audio_settings_mp3_rect = pygame.Rect(0, 0, 0, 0)
     audio_settings_gain_minus_rect = pygame.Rect(0, 0, 0, 0)
     audio_settings_gain_plus_rect = pygame.Rect(0, 0, 0, 0)
+    audio_settings_out_gain_minus_rect = pygame.Rect(0, 0, 0, 0)
+    audio_settings_out_gain_plus_rect = pygame.Rect(0, 0, 0, 0)
     log_history_browse_rect = pygame.Rect(0, 0, 0, 0)
     log_folder_browse_queue = None
 
@@ -525,7 +532,7 @@ def main():
                         if recorder.is_active():
                             _toggle_recording(recorder, audio_thread, logger, renderer, 0, 0, "OUT")
                         if mic_recorder.is_active():
-                            _toggle_recording(mic_recorder, audio_io_thread, logger, renderer, 0, 0, "MIC")
+                            _toggle_recording(mic_recorder, audio_io_thread, logger, renderer, 0, 0, "IN")
                         confirm_exit_open = False
                         running = False
                     elif no_rect.collidepoint(event.pos):
@@ -561,6 +568,14 @@ def main():
                         cfg.mic_boost_db = min(30.0, cfg.mic_boost_db + 2.0)
                         audio_io_thread.set_gain_db(cfg.mic_boost_db)
                         logger.add_event(f"Ganho do mic: +{cfg.mic_boost_db:.0f}dB", level="INFO", source="RECORDING", event="MIC_GAIN_CHANGED")
+                    elif audio_settings_out_gain_minus_rect.collidepoint(event.pos):
+                        cfg.out_boost_db = max(-12.0, cfg.out_boost_db - 2.0)
+                        audio_thread.set_out_gain_db(cfg.out_boost_db)
+                        logger.add_event(f"Ganho do OUT: {cfg.out_boost_db:+.0f}dB", level="INFO", source="RECORDING", event="OUT_GAIN_CHANGED")
+                    elif audio_settings_out_gain_plus_rect.collidepoint(event.pos):
+                        cfg.out_boost_db = min(20.0, cfg.out_boost_db + 2.0)
+                        audio_thread.set_out_gain_db(cfg.out_boost_db)
+                        logger.add_event(f"Ganho do OUT: {cfg.out_boost_db:+.0f}dB", level="INFO", source="RECORDING", event="OUT_GAIN_CHANGED")
                     elif audio_settings_close_rect.collidepoint(event.pos):
                         renderer.audio_settings_open = False
                     else:
@@ -643,7 +658,7 @@ def main():
                 ):
                     mic_rate = latest_audio_io.input.sample_rate if latest_audio_io else 0
                     mic_channels = latest_audio_io.input.channels if latest_audio_io else 0
-                    _toggle_recording(mic_recorder, audio_io_thread, logger, renderer, mic_rate, mic_channels, "MIC")
+                    _toggle_recording(mic_recorder, audio_io_thread, logger, renderer, mic_rate, mic_channels, "IN")
                 elif event.pos[1] >= HEADER_H and renderer.lufs_threshold_minus_rect.collidepoint(
                     (event.pos[0], event.pos[1] - HEADER_H)
                 ):
@@ -784,7 +799,7 @@ def main():
         # polled here (main thread) rather than logged directly from
         # AudioRecorder.write() -- see audio_recorder.py's module docstring
         # for why that split matters.
-        for rec, rec_label in ((recorder, "OUT"), (mic_recorder, "MIC")):
+        for rec, rec_label in ((recorder, "OUT"), (mic_recorder, "IN")):
             rec_error = rec.pop_pending_error()
             if rec_error:
                 logger.add_event(f"Recording ({rec_label}) storage unavailable: {rec_error}", level="ERROR", source="RECORDING", event="REC_ERROR")
@@ -875,7 +890,7 @@ def main():
             renderer.draw_compact(screen, theme.COMPACT_COLORKEY)
             compact_restore_rect = renderer.draw_compact_restore_button(screen)
             compact_theme_rect = renderer.draw_theme_button(
-                screen, pygame.Rect(compact_restore_rect.right + 4, compact_restore_rect.y, 22, 22)
+                screen, pygame.Rect(compact_restore_rect.right + 2, compact_restore_rect.y, 20, 20)
             )
         else:
             w, h = screen.get_size()
@@ -887,11 +902,12 @@ def main():
             pygame.draw.line(screen, theme.PANEL_BORDER, (0, HEADER_H - 1), (w, HEADER_H - 1))
 
             # All action buttons grouped on the right, "Saída" (device
-            # picker) rightmost-but-one right next to "Modo compacto" --
-            # leaves the whole left side free for the status widget below,
-            # instead of the two competing for the same strip in the middle.
+            # picker) rightmost -- leaves the whole left side free for the
+            # status widget below. "Sempre no topo"/"Modo compacto" moved
+            # to small icon buttons next to the "C" theme button instead
+            # (see below), not in this row anymore.
             _layout_buttons_right_to_left(
-                w, 6, STOP_BUTTON_RECT, COLLAPSE_BUTTON_RECT, TOPMOST_BUTTON_RECT, COMPACT_BUTTON_RECT, DEVICE_BUTTON_RECT,
+                w, 6, STOP_BUTTON_RECT, COLLAPSE_BUTTON_RECT, DEVICE_BUTTON_RECT,
             )
 
             device_display = "Automático (padrão do Windows)"
@@ -902,12 +918,10 @@ def main():
                         break
 
             _draw_button(screen, renderer.font_md, DEVICE_BUTTON_RECT, f"Saída: {device_display}",
-                         active=device_dropdown_open)
-            _draw_button(screen, renderer.font_md, STOP_BUTTON_RECT, "Parar & Salvar")
+                         active=device_dropdown_open, accent=renderer.chrome_accent())
+            _draw_button(screen, renderer.font_md, STOP_BUTTON_RECT, "Parar & Salvar", accent=renderer.chrome_accent())
             _draw_button(screen, renderer.font_md, COLLAPSE_BUTTON_RECT,
-                         "Mostrar painel" if renderer.top_collapsed else "Ocultar painel")
-            _draw_button(screen, renderer.font_md, TOPMOST_BUTTON_RECT, "Sempre no topo", active=always_on_top)
-            _draw_button(screen, renderer.font_md, COMPACT_BUTTON_RECT, "Modo compacto")
+                         "Mostrar painel" if renderer.top_collapsed else "Ocultar painel", accent=renderer.chrome_accent())
 
             live_warn = _compute_live_warn_level(cfg, latest_stats, latest_network, latest_process, renderer.spectrum_available)
             status_level = "crit" if status_critical_active else ("warn" if live_warn else "ok")
@@ -916,18 +930,25 @@ def main():
             emin, esec = divmod(erem, 60)
             uptime_text = f"{eh:02d}:{emin:02d}:{esec:02d}"
             status_x = 10
-            if status_x + 190 < DEVICE_BUTTON_RECT.x:
+            if status_x + 240 < DEVICE_BUTTON_RECT.x:
                 status_dot_rect, status_right_edge = _draw_status_widget(
                     screen, renderer.font_label, renderer.font_value, status_x, 6, 32, status_level, uptime_text,
                 )
                 theme_button_rect = renderer.draw_theme_button(screen, pygame.Rect(status_right_edge + 14, 6, 22, 22))
+                COMPACT_BUTTON_RECT.update(theme_button_rect.right + 6, 6, 22, 22)
+                TOPMOST_BUTTON_RECT.update(COMPACT_BUTTON_RECT.right + 6, 6, 22, 22)
+                renderer.draw_compact_toggle_icon_button(screen, COMPACT_BUTTON_RECT)
+                renderer.draw_topmost_toggle_icon_button(screen, TOPMOST_BUTTON_RECT, always_on_top)
             else:
                 status_dot_rect = pygame.Rect(0, 0, 0, 0)  # window too narrow -- no room, no stale hit target
                 theme_button_rect = pygame.Rect(0, 0, 0, 0)
+                COMPACT_BUTTON_RECT.update(0, 0, 0, 0)
+                TOPMOST_BUTTON_RECT.update(0, 0, 0, 0)
 
             if device_dropdown_open:
                 _, dropdown_row_rects = _draw_device_dropdown(
                     screen, renderer.font_row, DEVICE_BUTTON_RECT, available_devices, selected_device_name,
+                    accent=renderer.chrome_accent(),
                 )
 
             if renderer.audio_settings_open:
@@ -938,8 +959,9 @@ def main():
                     detail = f"{cfg.recording_sample_rate / 1000:.1f}kHz · {cfg.recording_channels}ch · {cfg.recording_bit_depth}-bit"
                 (audio_settings_browse_rect, audio_settings_close_rect,
                  audio_settings_wav_rect, audio_settings_mp3_rect,
-                 audio_settings_gain_minus_rect, audio_settings_gain_plus_rect) = renderer.draw_audio_settings_popup(
-                    screen, str(directory), cfg.recording_format, detail, cfg.mic_boost_db,
+                 audio_settings_gain_minus_rect, audio_settings_gain_plus_rect,
+                 audio_settings_out_gain_minus_rect, audio_settings_out_gain_plus_rect) = renderer.draw_audio_settings_popup(
+                    screen, str(directory), cfg.recording_format, detail, cfg.mic_boost_db, cfg.out_boost_db,
                 )
 
             if renderer.log_history_open:
@@ -958,7 +980,7 @@ def main():
     if recorder.is_active():
         _toggle_recording(recorder, audio_thread, logger, renderer, 0, 0, "OUT")
     if mic_recorder.is_active():
-        _toggle_recording(mic_recorder, audio_io_thread, logger, renderer, 0, 0, "MIC")
+        _toggle_recording(mic_recorder, audio_io_thread, logger, renderer, 0, 0, "IN")
 
     for t in threads:
         t.stop()

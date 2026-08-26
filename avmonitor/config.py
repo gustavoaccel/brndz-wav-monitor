@@ -69,6 +69,13 @@ class Config:
     # -/+ stepper was added to the ÁUDIO I/O settings popup (0-30dB, 2dB
     # steps) so the user can tune it live instead of editing config.json.
     mic_boost_db: float = 12.0
+    # Same idea as mic_boost_db, mirrored for OUT -- applied before the
+    # recording sink and the meter/FFT/LUFS so they all agree on the
+    # real level. Default 0dB (no boost): unlike the mic, OUT already
+    # gets master_volume.scale applied, so this is only for the rare
+    # case of needing extra headroom on top of that. -/+ stepper in the
+    # same settings popup as the mic gain.
+    out_boost_db: float = 0.0
 
     recording_enabled: bool = True
     # Empty = auto: same brndz.wav-drive-then-fallback resolution as

@@ -71,8 +71,15 @@ class MomentaryLufsMeter:
         self._ms_ema = None
         self._tau_s = tau_s
 
-    def update(self, samples_int16: np.ndarray, channels: int, sample_rate: int) -> float:
-        x = samples_int16.astype(np.float64) / 32768.0
+    def update(self, samples_int16: np.ndarray, channels: int, sample_rate: int, scale: float = 1.0) -> float:
+        """`scale` is the same master-volume factor the VU meter/FFT
+        already apply -- WASAPI loopback taps the mix *before* the
+        Windows master volume stage, so without this the LUFS reading
+        stayed identical regardless of the OS output volume/mute while
+        the VU meter and EQ (which do apply it) visibly reacted. Found
+        directly: user muted the selected output and only the LUFS
+        number kept reading as if it were still playing."""
+        x = samples_int16.astype(np.float64) / 32768.0 * scale
         x = x.reshape(-1, channels) if channels > 1 else x.reshape(-1, 1)
         n_ch = x.shape[1]
 
