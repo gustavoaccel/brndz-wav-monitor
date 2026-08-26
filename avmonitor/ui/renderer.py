@@ -508,17 +508,17 @@ class Renderer:
         active = self._drag or self._hover
         if self.top_collapsed:
             hot = bool(active) and active[0] == "top_h"
-            color = theme.ACCENT if hot else theme.PANEL_BORDER
+            color = self.chrome_accent() if hot else theme.PANEL_BORDER
             pygame.draw.line(surface, color, (4, top_h + 1), (w - 4, top_h + 1), width=3 if hot else 2)
             return
         for i in range(len(cols) - 1):
             edge_x = (cols[i].right + cols[i + 1].x) // 2
             hot = active == ("col", i)
-            color = theme.ACCENT if hot else theme.PANEL_BORDER
+            color = self.chrome_accent() if hot else theme.PANEL_BORDER
             pygame.draw.line(surface, color, (edge_x, 4), (edge_x, top_h - 4), width=3 if hot else 1)
 
         hot = bool(active) and active[0] == "top_h"
-        color = theme.ACCENT if hot else theme.PANEL_BORDER
+        color = self.chrome_accent() if hot else theme.PANEL_BORDER
         pygame.draw.line(surface, color, (4, top_h), (w - 4, top_h), width=3 if hot else 1)
 
     def bg_colors(self):
@@ -577,15 +577,25 @@ class Renderer:
             theme.BAR_CLIP = _DARK_TEXT_DEFAULTS["BAR_CLIP"]
 
     def chrome_accent(self):
-        """Themed wine-family color, used only by event_text_color()'s
-        brndz branch (the bottom-of-EQ log flash text). Titles/buttons/
-        MIXER/watermark were themed with this at one point and reverted
-        per the user's explicit call: only the EQ bars and the LUFS meter
-        follow the color cycle -- everything else, including these,
-        stays fixed wine regardless of theme.
+        """Themed replacement for the old fixed theme.ACCENT (wine) --
+        panel titles, button borders, popup borders, idle-state colors,
+        the MIXER button, the watermark. Went back and forth on this one:
+        themed, then reverted to fixed-wine-everywhere, now themed again
+        per the user's final call ("volta pra como era antes, tira só o
+        brndz da regra" -- brndz keeps its own look either way, since its
+        palette is wine-toned regardless). Deliberately NOT used for
+        anything carrying real meaning (level meters, the LUFS threshold
+        marker, recording-active red, the status dot) -- those stay fixed
+        on purpose, same reasoning as _get_hbar_texture's docstring.
         """
         stops = _EQ_COLOR_STOPS.get(self.eq_color_theme, _COLOR_STOPS)
         return _bar_color_themed(0.62, stops)
+
+    def chrome_title(self):
+        """Deeper-shade themed replacement for theme.PANEL_TITLE (panel
+        headers: SISTEMA/ÁUDIO I/O/REDE/PROCESSOS/LOG/popup titles)."""
+        stops = _EQ_COLOR_STOPS.get(self.eq_color_theme, _COLOR_STOPS)
+        return _bar_color_themed(0.5, stops)
 
     def event_text_color(self, crit: bool):
         """Color for a log-flash event line (bottom of the EQ area).
@@ -619,7 +629,7 @@ class Renderer:
         _, panel_bg, panel_border = self.bg_colors()
         pygame.draw.rect(surface, panel_bg, rect, border_radius=6)
         pygame.draw.rect(surface, panel_border, rect, width=1, border_radius=6)
-        label = self._text(self.font_title, title, theme.PANEL_TITLE)
+        label = self._text(self.font_title, title, self.chrome_title())
         surface.blit(label, (rect.x + 12, rect.y + 8))
         pygame.draw.line(surface, panel_border, (rect.x + 12, rect.y + 26), (rect.right - 12, rect.y + 26))
 
@@ -960,12 +970,12 @@ class Renderer:
         plain ASCII -- no font-fallback risk the way a Unicode ○/●/✓ glyph
         would be.
         """
-        border = theme.CRIT if active else theme.ACCENT
+        border = theme.CRIT if active else self.chrome_accent()
         pygame.draw.rect(surface, theme.PANEL_BG, rect, border_radius=5)
         pygame.draw.rect(surface, border, rect, width=2 if active else 1, border_radius=5)
 
         bracket_color = theme.TEXT_DIM
-        dot_color = theme.CRIT if active else theme.PANEL_TITLE
+        dot_color = theme.CRIT if active else self.chrome_title()
         dot_r = 5
         gap = 4
 
@@ -1084,6 +1094,22 @@ class Renderer:
         inner_img = font.render(text, True, fill_color)
         surface.blit(inner_img, (x, y))
 
+    def _draw_mini_fader_icon(self, surface, rect):
+        """Tiny 3-fader-bank glyph for the MIXER button -- a track per
+        channel + a knob at a different height on each, just enough to
+        read as "mixer" at a glance without needing the real thing built
+        yet. Drawn in theme.BG (dark) against the button's own gradient
+        fill, same convention as the hollow "MIXER" text next to it."""
+        n = 3
+        gap = 3
+        track_w = max(1, (rect.width - gap * (n - 1)) // n)
+        knob_fracs = (0.35, 0.7, 0.5)
+        for i in range(n):
+            cx = rect.x + i * (track_w + gap) + track_w // 2
+            pygame.draw.line(surface, theme.BG, (cx, rect.y), (cx, rect.bottom), width=2)
+            ky = rect.bottom - int(rect.height * knob_fracs[i])
+            pygame.draw.circle(surface, theme.BG, (cx, ky), 3)
+
     def _draw_audio_io_panel(self, surface, rect, audio_io, recording, mic_recording=None):
         self._panel_rect(surface, rect, "ÁUDIO I/O")
 
@@ -1093,7 +1119,7 @@ class Renderer:
         gear_size = 20
         self.audio_settings_button_rect = pygame.Rect(rect.right - gear_size - 8, rect.y + 6, gear_size, gear_size)
         pygame.draw.rect(surface, theme.PANEL_BG, self.audio_settings_button_rect, border_radius=5)
-        pygame.draw.rect(surface, theme.ACCENT, self.audio_settings_button_rect, width=1, border_radius=5)
+        pygame.draw.rect(surface, self.chrome_accent(), self.audio_settings_button_rect, width=1, border_radius=5)
         self._draw_gear_plus_icon(
             surface, self.audio_settings_button_rect.center,
             min(self.audio_settings_button_rect.width, self.audio_settings_button_rect.height) / 2 - 1,
@@ -1157,19 +1183,29 @@ class Renderer:
         y += btn_h + 10
 
         # MIXER: placeholder only, no function yet -- just claiming its
-        # spot in the layout for a later session. Filled background +
-        # hollow/outline letters (deliberately different chrome from
-        # every other button here, so it reads as "not live yet" without
-        # needing a text label saying so). Fixed wine, like every other
-        # button -- only the EQ/LUFS meter follow the color theme.
-        mixer_h = 26
+        # spot in the layout for a later session. Gradient fill (the same
+        # low->high theme colors as the EQ bars, not a flat color) + a
+        # tiny fader-bank glyph + hollow/outline letters -- deliberately
+        # more ornate than every other button here, so it reads as
+        # "something bigger lives behind this" without needing a text
+        # label saying so.
+        mixer_h = 28
         if y + mixer_h <= rect.bottom - 8:
-            self.mixer_button_rect = pygame.Rect(rect.x + 10, rect.bottom - 8 - mixer_h, rect.width - 20, mixer_h)
-            fill_color = theme.ACCENT
-            pygame.draw.rect(surface, fill_color, self.mixer_button_rect, border_radius=5)
-            label_img_probe = self.font_label_bold.render("MIXER", True, theme.BG)
-            label_pos = label_img_probe.get_rect(center=self.mixer_button_rect.center).topleft
-            self._draw_hollow_text(surface, self.font_label_bold, "MIXER", label_pos, theme.BG, fill_color)
+            r = pygame.Rect(rect.x + 10, rect.bottom - 8 - mixer_h, rect.width - 20, mixer_h)
+            self.mixer_button_rect = r
+            for gx in range(r.width):
+                frac = gx / max(1, r.width - 1)
+                pygame.draw.line(surface, _bar_color_themed(frac, stops), (r.x + gx, r.y), (r.x + gx, r.bottom - 1))
+            pygame.draw.rect(surface, theme.TEXT, r, width=1, border_radius=6)
+
+            icon_rect = pygame.Rect(r.x + 10, r.y + 5, 26, r.height - 10)
+            self._draw_mini_fader_icon(surface, icon_rect)
+
+            mid_color = _bar_color_themed(0.5, stops)
+            label_img = self.font_label_bold.render("MIXER", True, theme.BG)
+            label_x = icon_rect.right + 10
+            label_y = r.centery - label_img.get_height() // 2
+            self._draw_hollow_text(surface, self.font_label_bold, "MIXER", (label_x, label_y), theme.BG, mid_color)
         else:
             self.mixer_button_rect = pygame.Rect(0, 0, 0, 0)
 
@@ -1195,7 +1231,7 @@ class Renderer:
         pygame.draw.rect(surface, theme.BG, box, border_radius=6)
         pygame.draw.rect(surface, theme.PANEL_BORDER, box, width=1, border_radius=6)
 
-        title = self._text(self.font_xs, "LOG", theme.PANEL_TITLE)
+        title = self._text(self.font_xs, "LOG", self.chrome_title())
         surface.blit(title, (box.x + 8, box.y + 6))
         # All-or-nothing, not truncated -- a fragment like "cli…" isn't
         # useful to anyone, so this only shows up when the full phrase
@@ -1314,15 +1350,15 @@ class Renderer:
         self._draw_log_box(surface, rect, log_events, dns_y - 8)
 
         pygame.draw.rect(surface, theme.PANEL_BG, self.flush_dns_button_rect, border_radius=5)
-        pygame.draw.rect(surface, theme.ACCENT, self.flush_dns_button_rect, width=1, border_radius=5)
+        pygame.draw.rect(surface, self.chrome_accent(), self.flush_dns_button_rect, width=1, border_radius=5)
         dns_label_text = self._truncate(self.font_row, "Flush DNS", self.flush_dns_button_rect.width - 12)
-        dns_label = self._text(self.font_row, dns_label_text, theme.ACCENT)
+        dns_label = self._text(self.font_row, dns_label_text, self.chrome_accent())
         surface.blit(dns_label, dns_label.get_rect(center=self.flush_dns_button_rect.center))
 
         pygame.draw.rect(surface, theme.PANEL_BG, self.map_network_button_rect, border_radius=5)
-        pygame.draw.rect(surface, theme.ACCENT, self.map_network_button_rect, width=1, border_radius=5)
+        pygame.draw.rect(surface, self.chrome_accent(), self.map_network_button_rect, width=1, border_radius=5)
         label_text = self._truncate(self.font_row, "Mapear Rede", self.map_network_button_rect.width - 12)
-        label = self._text(self.font_row, label_text, theme.ACCENT)
+        label = self._text(self.font_row, label_text, self.chrome_accent())
         surface.blit(label, label.get_rect(center=self.map_network_button_rect.center))
 
     def draw_audio_settings_popup(self, surface, directory_display, recording_format, detail_display, mic_gain_db, out_gain_db):
@@ -1349,9 +1385,9 @@ class Renderer:
         surface.blit(overlay, (0, 0))
 
         pygame.draw.rect(surface, self.bg_colors()[1], panel, border_radius=8)
-        pygame.draw.rect(surface, theme.ACCENT, panel, width=2, border_radius=8)
+        pygame.draw.rect(surface, self.chrome_accent(), panel, width=2, border_radius=8)
 
-        title = self._text(self.font_title, "GRAVAÇÃO — CONFIGURAÇÕES", theme.PANEL_TITLE)
+        title = self._text(self.font_title, "GRAVAÇÃO — CONFIGURAÇÕES", self.chrome_title())
         surface.blit(title, (panel.x + 16, panel.y + 12))
 
         close_rect = pygame.Rect(panel.right - 32, panel.y + 8, 22, 22)
@@ -1379,8 +1415,8 @@ class Renderer:
         mp3_rect = pygame.Rect(wav_rect.right + 10, y, 90, 28)
         for pill_rect, label, active in ((wav_rect, "WAV", recording_format != "mp3"), (mp3_rect, "MP3", recording_format == "mp3")):
             pygame.draw.rect(surface, theme.PANEL_BG, pill_rect, border_radius=5)
-            pygame.draw.rect(surface, theme.ACCENT if active else theme.PANEL_BORDER, pill_rect, width=2 if active else 1, border_radius=5)
-            pill_label = self._text(self.font_row, label, theme.ACCENT if active else theme.TEXT_DIM)
+            pygame.draw.rect(surface, self.chrome_accent() if active else theme.PANEL_BORDER, pill_rect, width=2 if active else 1, border_radius=5)
+            pill_label = self._text(self.font_row, label, self.chrome_accent() if active else theme.TEXT_DIM)
             surface.blit(pill_label, pill_label.get_rect(center=pill_rect.center))
         y += 36
 
@@ -1399,7 +1435,7 @@ class Renderer:
             step_label = self._text(self.font_row, label, theme.TEXT)
             surface.blit(step_label, step_label.get_rect(center=step_rect.center))
 
-        gain_text = self._text(self.font_row, f"+{mic_gain_db:.0f} dB", theme.ACCENT)
+        gain_text = self._text(self.font_row, f"+{mic_gain_db:.0f} dB", self.chrome_accent())
         gain_rect = gain_text.get_rect()
         gain_rect.center = ((minus_rect.right + plus_rect.left) // 2, minus_rect.centery)
         surface.blit(gain_text, gain_rect)
@@ -1416,7 +1452,7 @@ class Renderer:
             step_label = self._text(self.font_row, label, theme.TEXT)
             surface.blit(step_label, step_label.get_rect(center=step_rect.center))
 
-        out_gain_text = self._text(self.font_row, f"{'+' if out_gain_db >= 0 else ''}{out_gain_db:.0f} dB", theme.ACCENT)
+        out_gain_text = self._text(self.font_row, f"{'+' if out_gain_db >= 0 else ''}{out_gain_db:.0f} dB", self.chrome_accent())
         out_gain_rect = out_gain_text.get_rect()
         out_gain_rect.center = ((out_minus_rect.right + out_plus_rect.left) // 2, out_minus_rect.centery)
         surface.blit(out_gain_text, out_gain_rect)
@@ -1480,9 +1516,9 @@ class Renderer:
         surface.blit(overlay, (0, 0))
 
         pygame.draw.rect(surface, self.bg_colors()[1], panel, border_radius=8)
-        pygame.draw.rect(surface, theme.ACCENT, panel, width=2, border_radius=8)
+        pygame.draw.rect(surface, self.chrome_accent(), panel, width=2, border_radius=8)
 
-        title = self._text(self.font_title, "HISTÓRICO DE EVENTOS", theme.PANEL_TITLE)
+        title = self._text(self.font_title, "HISTÓRICO DE EVENTOS", self.chrome_title())
         surface.blit(title, (panel.x + 16, panel.y + 12))
 
         close_rect = pygame.Rect(panel.right - 32, panel.y + 8, 22, 22)
@@ -1570,14 +1606,14 @@ class Renderer:
         btn_h = 26
         self.open_taskmgr_button_rect = pygame.Rect(rect.x + 10, rect.bottom - btn_h - 8, rect.width - 20, btn_h)
         pygame.draw.rect(surface, theme.PANEL_BG, self.open_taskmgr_button_rect, border_radius=5)
-        pygame.draw.rect(surface, theme.ACCENT, self.open_taskmgr_button_rect, width=1, border_radius=5)
+        pygame.draw.rect(surface, self.chrome_accent(), self.open_taskmgr_button_rect, width=1, border_radius=5)
         # Longest button label in the whole toolbar -- the one that
         # actually visibly broke (spilled past its own rounded-rect
         # border, though still within this panel's column) on a narrow
         # PROCESSOS column before this was truncated like every other
         # button label already was.
         label_text = self._truncate(self.font_row, "Gerenciador de Tarefas", self.open_taskmgr_button_rect.width - 12)
-        label = self._text(self.font_row, label_text, theme.ACCENT)
+        label = self._text(self.font_row, label_text, self.chrome_accent())
         surface.blit(label, label.get_rect(center=self.open_taskmgr_button_rect.center))
 
     # ---- spectrum / meter ------------------------------------------------
@@ -1611,7 +1647,7 @@ class Renderer:
     def _draw_watermark(self, surface, rect):
         # Fixed wine, not themed -- only the EQ/LUFS meter follow the
         # color cycle, everything else (including this) stays put.
-        watermark_color = theme.ACCENT
+        watermark_color = self.chrome_accent()
         key = (rect.width, rect.height)
         if key != self._watermark_key:
             size = max(28, int(rect.height * 0.34))
@@ -1877,7 +1913,7 @@ class Renderer:
         (already pinned) gets the accent border, same convention as
         every other toggle button in this header."""
         pygame.draw.rect(surface, theme.PANEL_BG, rect)
-        pygame.draw.rect(surface, theme.ACCENT if active else theme.PANEL_BORDER, rect, width=2 if active else 1)
+        pygame.draw.rect(surface, self.chrome_accent() if active else theme.PANEL_BORDER, rect, width=2 if active else 1)
         self._draw_lock_icon(surface, rect)
         return rect
 
