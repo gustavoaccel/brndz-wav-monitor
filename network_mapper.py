@@ -251,14 +251,18 @@ def main():
             if wants_topmost != is_topmost:
                 win_native.set_always_on_top(hwnd, wants_topmost)
                 is_topmost = wants_topmost
-            elif wants_topmost and not yield_front_to_eq and win_native.find_window_containing("Configurações") is None:
+            elif (
+                wants_topmost and not yield_front_to_eq
+                and win_native.find_window_containing("Configurações") is None
+                and win_native.find_window_containing("Gerenciador de Tarefas") is None
+            ):
                 # Still reassert periodically even when the state hasn't
                 # changed -- another topmost window (STREAMING) could
                 # have reclaimed the front of the band since our last
-                # check. Skipped while Windows' own Settings window is
-                # open -- that one gets absolute priority regardless of
-                # any other window's always-on-top state (see main.py's
-                # _pin_settings_window_topmost).
+                # check. Skipped while Windows' own Settings or Task
+                # Manager window is open -- those get absolute priority
+                # regardless of any other window's always-on-top state
+                # (see main.py's _pin_window_topmost).
                 win_native.set_always_on_top(hwnd, True)
 
         w, h = screen.get_size()

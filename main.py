@@ -139,35 +139,37 @@ def _launch_streaming(logger=None):
             logger.add_event(f"Falha ao iniciar STREAMING: {e}", level="ERROR", source="AUDIO", event="STREAMING_ERROR")
 
 
-def _pin_settings_window_topmost():
-    """Windows' own Settings app ("Configurações") opens as a normal
+def _pin_window_topmost(title_substring: str):
+    """Generic version of what used to be Settings-only: some external
+    window ("Configurações", "Gerenciador de Tarefas") opens as a normal
     (non-topmost) window -- if this app's own window (or STREAMING's) is
-    pinned always-on-top, Settings could never render above it no matter
-    how much focus it gets (SetForegroundWindow doesn't let a normal
-    window rise above a topmost one). Runs on its own daemon thread.
+    pinned always-on-top, that window could never render above it no
+    matter how much focus it gets (SetForegroundWindow doesn't let a
+    normal window rise above a topmost one). Runs on its own daemon
+    thread, one instance per external window being pinned.
 
     Pinning it once wasn't reliably enough -- this app's own periodic
-    HWND_TOPMOST reassertion tries to defer to Settings once it's
-    detected, but there's a real race window between Settings opening
-    and this thread finding+pinning it (up to ~5s of polling) during
-    which the OTHER window's own reassert cycle can still win a claim.
-    Pinning is explicit priority the user asked for ("prioridade
-    máxima, mesmo que o always on top das outras janelas esteja
-    ativo") -- so this keeps re-claiming the front spot for Settings
-    every 0.5s for as long as it stays open, closing that race instead
-    of just reducing its odds. Exits on its own once Settings closes.
+    HWND_TOPMOST reassertion tries to defer to it once detected, but
+    there's a real race window between that window opening and this
+    thread finding+pinning it (up to ~5s of polling) during which the
+    OTHER window's own reassert cycle can still win a claim. Both
+    Settings and Task Manager get explicit "priority máxima, mesmo com
+    o lock do programa ativado" per the user's request -- so this keeps
+    re-claiming the front spot every 0.5s for as long as the window
+    stays open, closing that race instead of just reducing its odds.
+    Exits on its own once the window closes.
     """
     hwnd = None
     deadline = time.time() + 5.0
     while hwnd is None and time.time() < deadline:
         time.sleep(0.2)
-        hwnd = win_native.find_window_containing("Configurações")
+        hwnd = win_native.find_window_containing(title_substring)
     if hwnd is None:
         return
     while True:
         win_native.set_always_on_top(hwnd, True)
         time.sleep(0.5)
-        if win_native.find_window_containing("Configurações") is None:
+        if win_native.find_window_containing(title_substring) is None:
             return
 
 
@@ -181,7 +183,7 @@ def _open_windows_mixer(logger=None):
     """
     try:
         subprocess.Popen(["cmd", "/c", "start", "", "ms-settings:apps-volume"], shell=False)
-        threading.Thread(target=_pin_settings_window_topmost, daemon=True).start()
+        threading.Thread(target=_pin_window_topmost, args=("Configurações",), daemon=True).start()
         if logger:
             logger.add_event("Config. de som do Windows aberta", level="OK", source="AUDIO", event="MIXER_START")
     except Exception as e:
@@ -191,6 +193,11 @@ def _open_windows_mixer(logger=None):
 
 def _launch_task_manager(logger=None):
     ok, detail = win_native.launch_task_manager()
+    if ok:
+        # Same absolute-priority treatment as Windows' own Settings --
+        # explicit request: Task Manager should render above everything,
+        # even this app's own "sempre no topo" lock.
+        threading.Thread(target=_pin_window_topmost, args=("Gerenciador de Tarefas",), daemon=True).start()
     if logger:
         logger.add_event(
             "Gerenciador de Tarefas iniciado" if ok else f"Falha ao iniciar Gerenciador de Tarefas: {detail}",
@@ -937,22 +944,29 @@ def main():
             #
             # Exception: Windows' own Settings window (opened by the
             # "Config. Avançadas" button) always gets absolute priority,
-            # no matter what. STREAMING and Mapa de Rede also mirror/claim
-            # topmost on their own periodic cadence (tracking this
-            # window's own toggle live -- see win_native.is_window_topmost()),
-            # so in normal (non-compact) mode with the toggle on, this
-            # window defers to them too ("most recently opened wins",
-            # same principle STREAMING applies to its own prompt dialogs)
+            # no matter what -- same now for Task Manager ("Gerenciador
+            # de Tarefas"), explicit request: both should render above
+            # everything, even this window's own compact-mode lock.
+            # STREAMING and Mapa de Rede also mirror/claim topmost on
+            # their own periodic cadence (tracking this window's own
+            # toggle live -- see win_native.is_window_topmost()), so in
+            # normal (non-compact) mode with the toggle on, this window
+            # defers to them too ("most recently opened wins", same
+            # principle STREAMING applies to its own prompt dialogs)
             # instead of fighting for the front spot every ~1.5s. Compact
-            # mode is the one case that does NOT defer to STREAMING/Mapa
-            # de Rede -- it's meant to stay in evidence over the app's
-            # own other windows too, not just third-party ones.
-            settings_open = win_native.find_window_containing("Configurações") is not None
+            # mode does NOT defer to STREAMING/Mapa de Rede -- it's meant
+            # to stay in evidence over the app's own other windows too,
+            # not just third-party ones -- but it DOES still defer to
+            # Settings/Task Manager, which outrank even compact mode.
+            priority_window_open = (
+                win_native.find_window_containing("Configurações") is not None
+                or win_native.find_window_containing("Gerenciador de Tarefas") is not None
+            )
             own_window_open = (
                 win_native.find_window_containing("STREAMING") is not None
                 or win_native.find_window_containing("Mapa de Rede") is not None
             )
-            if not settings_open and (compact_mode or not own_window_open):
+            if not priority_window_open and (compact_mode or not own_window_open):
                 hwnd = _get_hwnd()
                 if hwnd:
                     win_native.set_always_on_top(hwnd, True)

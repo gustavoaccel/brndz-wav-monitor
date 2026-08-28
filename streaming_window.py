@@ -29,6 +29,7 @@ import urllib.request
 import webbrowser
 from collections import deque
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -75,6 +76,13 @@ class StreamMetrics:
     view_count: Optional[int] = None
     like_count: Optional[int] = None
     comment_count: Optional[int] = None
+    # Epoch seconds the live broadcast actually started, per YouTube's own
+    # liveStreamingDetails.actualStartTime -- used for the "tempo online"
+    # counter so it tracks the live's real on-air time, not how long this
+    # window has happened to be open (which used to be session_start_time
+    # -- wrong whenever the window was opened after the stream had already
+    # been live a while, or reopened mid-stream).
+    actual_start_time: Optional[float] = None
 
 
 class YouTubeMetricsWorker(threading.Thread):
@@ -182,6 +190,17 @@ class YouTubeMetricsWorker(threading.Thread):
             except (TypeError, ValueError):
                 return None
 
+        def _epoch(d, k):
+            # YouTube returns RFC 3339 ("...Z" or "+00:00") -- Python
+            # 3.11+'s fromisoformat() accepts the "Z" suffix natively.
+            v = d.get(k) if d else None
+            if not v:
+                return None
+            try:
+                return datetime.fromisoformat(v).astimezone(timezone.utc).timestamp()
+            except (TypeError, ValueError):
+                return None
+
         return StreamMetrics(
             timestamp=time.time(),
             connected=True,
@@ -192,6 +211,7 @@ class YouTubeMetricsWorker(threading.Thread):
             view_count=_int(stats, "viewCount"),
             like_count=_int(stats, "likeCount"),
             comment_count=_int(stats, "commentCount"),
+            actual_start_time=_epoch(live, "actualStartTime") if live else None,
         )
 
 
@@ -550,8 +570,9 @@ def _draw_compact(surface, latest, accent, restore_rect, move_rect, buttons_visi
     cluster_left = min(r.x for r in (restore_rect, move_rect, watch_rect) if r is not None)
     if uptime_text:
         # "Tempo Online" -- just the counter, no label, right next to the
-        # status text, same HH:MM:SS format as the main window's own
-        # uptime widget (main.py's session_start_time/_draw_status_widget).
+        # status text. Tracks the live broadcast's own on-air time (see
+        # main()'s uptime_text computation), not how long this window has
+        # been open -- HH:MM:SS when live, "--:--:--" otherwise.
         uptime_img = _text(font_status, uptime_text, theme.TEXT_LABEL)
         uptime_x = 24 + status_img.get_width() + 10
         if uptime_x + uptime_img.get_width() < cluster_left - 4:
@@ -674,7 +695,6 @@ def main():
         status="unconfigured" if not (cfg.youtube_video_id and cfg.youtube_api_key) else "unknown",
     )
     history: "deque[tuple[float, int]]" = deque(maxlen=_HISTORY_MAXLEN)
-    session_start_time = time.time()
 
     api_key_prompt_q = None
     video_prompt_q = None
@@ -858,11 +878,15 @@ def main():
             if wants_topmost != is_topmost:
                 win_native.set_always_on_top(hwnd, wants_topmost)
                 is_topmost = wants_topmost
-            elif wants_topmost and not yield_front_to_eq and win_native.find_window_containing("Configurações") is None:
-                # Windows' own Settings window gets absolute priority
-                # regardless of any other window's always-on-top state
-                # (see main.py's _pin_settings_window_topmost) -- skip
-                # reclaiming the front spot while it's open.
+            elif (
+                wants_topmost and not yield_front_to_eq
+                and win_native.find_window_containing("Configurações") is None
+                and win_native.find_window_containing("Gerenciador de Tarefas") is None
+            ):
+                # Windows' own Settings and Task Manager windows get
+                # absolute priority regardless of any other window's
+                # always-on-top state (see main.py's _pin_window_topmost)
+                # -- skip reclaiming the front spot while either is open.
                 win_native.set_always_on_top(hwnd, True)
 
         try:
@@ -872,10 +896,19 @@ def main():
         except queue.Empty:
             pass
 
-        elapsed = max(0.0, time.time() - session_start_time)
-        eh, erem = divmod(int(elapsed), 3600)
-        emin, esec = divmod(erem, 60)
-        uptime_text = f"{eh:02d}:{emin:02d}:{esec:02d}"
+        # Tracks the live broadcast's own on-air time (YouTube's
+        # actualStartTime), not how long this window has been open --
+        # this window could easily be opened well after a stream already
+        # went live, or reopened mid-stream, and "tempo online" is meant
+        # to answer "há quanto tempo a live está no ar", not "há quanto
+        # tempo eu abri o STREAMING".
+        if latest.status == "live" and latest.actual_start_time:
+            elapsed = max(0.0, time.time() - latest.actual_start_time)
+            eh, erem = divmod(int(elapsed), 3600)
+            emin, esec = divmod(erem, 60)
+            uptime_text = f"{eh:02d}:{emin:02d}:{esec:02d}"
+        else:
+            uptime_text = "--:--:--"
 
         if compact_mode:
             cw, ch = screen.get_size()
