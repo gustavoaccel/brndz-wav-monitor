@@ -39,62 +39,111 @@ def _watermark_font_path():
 
 _COLOR_STOPS = [
     (0.0, theme.BAR_LOW),
-    (0.5, theme.BAR_MID),
-    (0.8, theme.BAR_HIGH),
+    (0.3, theme.BAR_MID),
+    (0.65, theme.BAR_HIGH),
     (1.0, theme.BAR_CLIP),
 ]
 
 # Alternate EQ palettes, cycled by the "C" button -- available on both the
 # main panel and compact mode, one shared choice (Renderer.eq_color_theme)
 # so switching between the two views never shows a different color.
-_EQ_THEME_ORDER = ["quente", "frio", "medio", "brndz", "neon", "cyberpunk", "radioativo"]
+# Display names the user uses for these (internal keys unchanged to avoid
+# rippling the rename through every dict/docstring below): "quente" =
+# tema padrão (amarelo ouro), "radioativo" = verde radioativo, "frio" =
+# blue sky, "medio" = purple haze, "cyberpunk" = cyberpink, "brndz" =
+# brndz vinho.
+_EQ_THEME_ORDER = ["quente", "radioativo", "frio", "medio", "cyberpunk", "brndz"]
+# "rainbow" is a compact-mode-exclusive 7th entry -- not a real palette in
+# _EQ_COLOR_STOPS/_EQ_THEME_BG, so every existing `.get(eq_color_theme,
+# <fallback>)` lookup already resolves it to the default "quente" look
+# automatically wherever it isn't specifically handled (the main panel
+# renders "rainbow" as plain "quente", exactly the fallback the user
+# asked for). draw_compact() is the one place that checks for it by name
+# and does the real left-to-right animated sweep across the 6 real
+# palettes in _EQ_THEME_ORDER instead.
+_EQ_THEME_ORDER_COMPACT = _EQ_THEME_ORDER + ["rainbow"]
+_RAINBOW_HOLD_S = 0.0  # no static hold at all -- one wipe finishes, the next starts immediately
+_RAINBOW_WIPE_S = 1.8  # how long the left-to-right wipe itself takes
+# Went through two corrections: the original 15s/2.5s hold/wipe was a
+# miscalculation, fixed to a 1s/2s cycle -- but the 1s hold still read as
+# a pause between wipes, and the user explicitly wanted constant motion
+# ("deveria estar sempre trocando de cor"). Hold dropped to 0 entirely
+# (a wipe finishing *is* the next one starting) and the wipe itself
+# nudged a bit faster per "pode ser um pouco mais rápido".
+# How wide (as a fraction of the bar area's width) the soft crossfade
+# band around the sweep line is -- a bar isn't purely "old" or "new"
+# palette, it blends across roughly this many bar-widths of travel
+# instead of snapping the instant the line passes it.
+_RAINBOW_FEATHER = 0.25
 _EQ_COLOR_STOPS = {
     "quente": _COLOR_STOPS,  # unchanged default -- dark wine -> gold -> orange -> red
+    # All palettes below share the same aggressive stop positions as
+    # "brndz" (0.3 / 0.65 instead of 0.5 / 0.8) -- the user flagged that
+    # every theme except brndz felt "dead"/muted in compact mode: the
+    # climb from the dark base color to something vivid didn't start
+    # until halfway up the bar, so anything short of a loud peak stayed
+    # visually flat. Moving the first breakpoint earlier means a bar only
+    # a third of the way up already shows real color, same as brndz.
+    # Blue/cyan holds through most of the climb; a violet-pink flash only
+    # shows in the last ~15%. Pushed to match cyberpink's aggressiveness
+    # after the user felt it was still too muted next to it: vivid
+    # electric blue hits by 20% (was a medium-saturation blue at 30%) and
+    # stays bright/saturated all the way to 85%, instead of a comparatively
+    # dim/desaturated blue -- same "hits vivid fast, stays vivid" recipe
+    # as cyberpunk's own magenta stage, just in blue instead of pink.
     "frio": [
-        (0.0, (18, 42, 66)),
-        (0.5, (34, 132, 176)),
-        (0.8, (46, 184, 150)),
-        (1.0, (94, 232, 150)),
+        (0.0, (8, 22, 50)),
+        (0.2, (20, 150, 235)),
+        (0.85, (60, 205, 250)),
+        (1.0, (225, 105, 220)),
     ],
+    # "purple haze" -- explicitly asked to be more aggressive than the
+    # other mid-tone palettes: darker base, hits a vivid violet-magenta
+    # by 25% instead of 30%, and a brighter/more saturated peak than the
+    # old (208,108,220).
     "medio": [
-        (0.0, (44, 24, 68)),
-        (0.5, (108, 58, 168)),
-        (0.8, (158, 78, 198)),
-        (1.0, (208, 108, 220)),
+        (0.0, (38, 14, 58)),
+        (0.25, (140, 40, 190)),
+        (0.6, (190, 50, 210)),
+        (1.0, (230, 90, 235)),
     ],
-    # More aggressive than the other palettes on purpose (user's explicit
-    # ask): red shows up early instead of staying brown until near the
-    # top -- brown base -> crimson/wine by 30% -> scarlet at the peak.
+    # Brown base -> crimson by 30% -> red, holding red far longer than
+    # before -- only the very last 8% bursts into the brand's own gold
+    # accent (theme.GOLD is a close match) instead of just a brighter red,
+    # the classic wine+gold brndz pairing rather than a generic flash.
     "brndz": [
         (0.0, (46, 22, 18)),
         (0.3, (140, 32, 38)),
         (0.65, (185, 40, 30)),
-        (1.0, (215, 60, 20)),
+        (0.92, (215, 60, 20)),
+        (1.0, (235, 190, 70)),
     ],
-    # Neon green -> moss yellow, with a hot-pink accent at the very top --
-    # explicitly requested as a more vivid/neon option than the other 4,
-    # which all stay fairly dark/moody even at full brightness.
-    "neon": [
-        (0.0, (24, 46, 18)),
-        (0.5, (70, 235, 55)),
-        (0.8, (175, 220, 40)),
-        (1.0, (255, 55, 180)),
-    ],
-    # Cyberpunk pink -- deep purple-blue base into hot magenta, capped with
-    # an electric cyan accent at the peak (the classic magenta+cyan pairing
-    # that reads as "cyberpunk"/synthwave rather than just "pink").
+    # "cyberpink" -- also asked to be more aggressive: hot magenta now
+    # hits by 20% (was 30%), pushed a bit more saturated throughout,
+    # electric cyan accent at the very peak kept (the classic magenta+
+    # cyan pairing that reads as "cyberpunk"/synthwave, not just "pink").
     "cyberpunk": [
-        (0.0, (32, 10, 46)),
-        (0.5, (220, 20, 140)),
-        (0.8, (255, 55, 195)),
-        (1.0, (60, 235, 255)),
+        (0.0, (28, 8, 40)),
+        (0.2, (230, 15, 150)),
+        (0.55, (255, 50, 200)),
+        (1.0, (70, 245, 255)),
     ],
-    # Radioactive moss yellow-green transitioning into orange-red at the top.
+    # "verde radioativo" -- merges what used to be two separate green
+    # palettes ("neon" and the old "radioativo") into one, per the user's
+    # explicit request ("não precisamos ter dois verdes"): dark olive base
+    # -> the old "radioativo" theme's own moss/yellow-green (190,230,20) as
+    # a brief handoff, not a destination -> classic neon green held flat
+    # as the *dominant* color across most of the upper range (40%-82%) --
+    # the user's own framing after a few iterations ("o verde NEON precisa
+    # ser a cor predominante") -> a cyan-leaning green flash only in the
+    # last sliver at the very peak. No orange/red (old "radioativo") and
+    # no pink (old "neon") anywhere in the ramp.
     "radioativo": [
-        (0.0, (36, 42, 8)),
-        (0.5, (190, 230, 20)),
-        (0.8, (235, 140, 30)),
-        (1.0, (235, 60, 25)),
+        (0.0, (26, 36, 10)),
+        (0.22, (190, 230, 20)),
+        (0.4, (70, 235, 55)),
+        (0.82, (70, 235, 55)),
+        (1.0, (30, 255, 165)),
     ],
 }
 
@@ -122,7 +171,6 @@ _EQ_THEME_BG = {
     # explicit request. Warm off-white/greige, not stark white, so the
     # wine accent (text/bars/buttons) reads as the star of the palette.
     "brndz": ((222, 213, 202), (204, 192, 180), (150, 100, 92)),
-    "neon": ((13, 19, 13), (20, 29, 20), (40, 58, 38)),
     "cyberpunk": ((10, 7, 15), (18, 13, 24), (48, 32, 58)),
     "radioativo": ((18, 18, 10), (27, 27, 16), (56, 56, 30)),
 }
@@ -137,6 +185,57 @@ def _bar_color_themed(v: float, stops):
     return stops[-1][1]
 
 
+_DERIVED_WINDOW_DARK_DEFAULTS = None
+
+
+def apply_theme_to_window(eq_color_theme: str) -> None:
+    """One-shot version of Renderer.sync_theme_module() for a *derived*
+    window's own process (network_mapper.py, streaming_window.py) --
+    mutates theme.py's module constants once at startup to match
+    whatever palette was active in the main app the last time it ran
+    (persisted to config.json as cfg.eq_color_theme), instead of always
+    opening in the fixed default look. Each derived window is its own
+    OS process with its own fresh import of theme.py, so this can't
+    affect the main app's process or vice versa -- no shared state to
+    worry about, just call this once before the render loop starts.
+
+    Deliberately a SEPARATE function from sync_theme_module() rather than
+    a shared one, for one real difference: this one also sets
+    theme.ACCENT, which sync_theme_module() leaves untouched on purpose
+    (the main app routes anything that needs to react to the theme
+    through chrome_accent()/chrome_title() instead, keeping theme.ACCENT
+    fixed wine everywhere -- a past, deliberate decision not worth
+    disturbing). network_mapper.py has no such per-instance accent
+    method and reads theme.ACCENT directly, so it needs the mutation;
+    reusing sync_theme_module() as-is here would just silently do
+    nothing for it.
+    """
+    global _DERIVED_WINDOW_DARK_DEFAULTS
+    if _DERIVED_WINDOW_DARK_DEFAULTS is None:
+        _DERIVED_WINDOW_DARK_DEFAULTS = {
+            "TEXT": theme.TEXT, "TEXT_DIM": theme.TEXT_DIM,
+            "TEXT_LABEL": theme.TEXT_LABEL, "GOLD": theme.GOLD,
+            "OK": theme.OK, "WARN": theme.WARN, "BAR_CLIP": theme.BAR_CLIP,
+            "ACCENT": theme.ACCENT,
+        }
+    bg, panel_bg, panel_border = _EQ_THEME_BG.get(eq_color_theme, _EQ_THEME_BG["quente"])
+    theme.BG, theme.PANEL_BG, theme.PANEL_BORDER = bg, panel_bg, panel_border
+    stops = _EQ_COLOR_STOPS.get(eq_color_theme, _COLOR_STOPS)
+    theme.ACCENT = _bar_color_themed(0.62, stops)
+    if eq_color_theme == "brndz":
+        theme.TEXT = (40, 24, 22)
+        theme.TEXT_DIM = (112, 84, 78)
+        theme.TEXT_LABEL = (148, 120, 112)
+        theme.GOLD = (150, 40, 35)
+        theme.OK = (28, 118, 58)
+        theme.WARN = (188, 110, 28)
+        theme.BAR_CLIP = (30, 130, 220)
+    else:
+        d = _DERIVED_WINDOW_DARK_DEFAULTS
+        theme.TEXT, theme.TEXT_DIM, theme.TEXT_LABEL = d["TEXT"], d["TEXT_DIM"], d["TEXT_LABEL"]
+        theme.GOLD, theme.OK, theme.WARN, theme.BAR_CLIP = d["GOLD"], d["OK"], d["WARN"], d["BAR_CLIP"]
+
+
 _FREQ_LABELS_HZ = [60, 125, 250, 500, 1000, 2000, 4000, 8000, 16000]
 
 _N_SEGMENTS = 28
@@ -147,7 +246,7 @@ _BOTTOM_MARGIN = 20
 _TOP_MARGIN = 18
 
 _TOP_PAD = 8
-_MIN_TOP_H = 285  # tall enough for the Áudio I/O panel's two stacked REC buttons (MIC + OUT/gear) + the LUFS row under OUT
+_MIN_TOP_H = 280  # tall enough for the Áudio I/O panel's stacked IN+REC IN+OUT+REC OUT+action-button rows. Hiding IN below a height threshold was tried and reverted -- saved little space and the user missed IN when it disappeared.
 _MIN_COL_FRAC = 0.12
 _SPLIT_HIT = 10
 
@@ -262,6 +361,7 @@ class Renderer:
         self.mic_rec_button_rect = pygame.Rect(0, 0, 0, 0)
         self.audio_settings_button_rect = pygame.Rect(0, 0, 0, 0)
         self.mixer_button_rect = pygame.Rect(0, 0, 0, 0)
+        self.streaming_button_rect = pygame.Rect(0, 0, 0, 0)
         self.audio_settings_open = False
         self.log_box_rect = pygame.Rect(0, 0, 0, 0)
         self.log_history_open = False
@@ -273,14 +373,28 @@ class Renderer:
         # these -- quente is the long-standing default look (unchanged
         # unless the user clicks), the rest are discrete alternates, not a
         # continuous picker, to keep this a one-button toggle instead of
-        # new UI chrome. One shared choice for both views.
-        self.eq_color_theme = "quente"
+        # new UI chrome. One shared choice for both views. Restored from
+        # cfg.eq_color_theme (persisted to config.json on every cycle, see
+        # main.py's theme-button click handlers) so the app reopens in
+        # whatever palette was last selected, instead of always resetting
+        # to quente -- the same persisted value derived windows read too.
+        self.eq_color_theme = cfg.eq_color_theme
+        # "rainbow" compact-mode animation state -- which two real
+        # palettes (indices into _EQ_THEME_ORDER) the wipe is currently
+        # between, and when the current hold/wipe cycle started. Lazily
+        # initialized on first use (_rainbow_state()) rather than here, so
+        # the very first hold starts counting from whenever compact mode
+        # is actually first entered, not from app startup.
+        self._rainbow_from_idx = 0
+        self._rainbow_to_idx = 1
+        self._rainbow_phase_start = None
 
         self.lufs_alert_threshold = cfg.lufs_alert_threshold
         self.lufs_threshold_minus_rect = pygame.Rect(0, 0, 0, 0)
         self.lufs_threshold_plus_rect = pygame.Rect(0, 0, 0, 0)
 
         self._text_cache = {}
+        self._truncate_cache = {}
 
         self._row_colors = [_bar_color((seg + 0.5) / _N_SEGMENTS) for seg in range(_N_SEGMENTS)]
         self._row_colors_theme = "quente"
@@ -494,6 +608,7 @@ class Renderer:
             self.mic_rec_button_rect = pygame.Rect(0, 0, 0, 0)
             self.audio_settings_button_rect = pygame.Rect(0, 0, 0, 0)
             self.mixer_button_rect = pygame.Rect(0, 0, 0, 0)
+            self.streaming_button_rect = pygame.Rect(0, 0, 0, 0)
         self._draw_split_handles(surface, w, top_h, cols)
         self._draw_spectrum(surface, eq_rect)
         if lufs_rect is not None:
@@ -599,16 +714,17 @@ class Renderer:
 
     def event_text_color(self, crit: bool):
         """Color for a log-flash event line (bottom of the EQ area).
-        Critical stays theme.CRIT (fixed red, same "danger" convention as
-        the status dot) always. Non-critical is theme.WARN (yellow) on
-        every dark theme, but that reads poorly on brndz's light beige --
-        crimson instead there, for the same reason GOLD/OK got swapped.
+        Critical stays theme.CRIT (fixed red, same universal "danger"
+        convention as the status dot) always. Non-critical follows
+        chrome_accent() -- same "everything but the VU meter follows the
+        theme" rule as titles/buttons/watermark/icons, in every palette
+        (used to be plain theme.WARN except on brndz, which looked
+        inconsistent once the rest of the chrome started following the
+        theme everywhere else too).
         """
         if crit:
             return theme.CRIT
-        if self.eq_color_theme == "brndz":
-            return self.chrome_accent()
-        return theme.WARN
+        return self.chrome_accent()
 
     def _text(self, font, text, color):
         """Cached font.render: the stats/labels barely change between
@@ -640,11 +756,28 @@ class Renderer:
         # nothing clips a draw at its own column's edge automatically).
         if max_w <= 0:
             return ""
+        # Cached: the character-by-character shrink loop below re-measures
+        # the string with font.size() on every call, and most of this
+        # panel's text (process names, device names) is identical from one
+        # frame to the next -- profiling found font.size() as the single
+        # biggest chunk of render time in the whole app (27k+ calls across
+        # a few seconds), almost entirely from re-truncating the same
+        # strings at the same column widths 60x/sec for no reason.
+        key = (id(font), text, max_w)
+        cached = self._truncate_cache.get(key)
+        if cached is not None:
+            return cached
+        if len(self._truncate_cache) > 1000:
+            self._truncate_cache.clear()
         if font.size(text)[0] <= max_w:
-            return text
-        while text and font.size(text + "…")[0] > max_w:
-            text = text[:-1]
-        return f"{text}…" if text else ""
+            result = text
+        else:
+            t = text
+            while t and font.size(t + "…")[0] > max_w:
+                t = t[:-1]
+            result = f"{t}…" if t else ""
+        self._truncate_cache[key] = result
+        return result
 
     def _row(self, surface, rect, y, left_text, right_text, color):
         # Right side capped to at most half the column so a long value
@@ -808,11 +941,14 @@ class Renderer:
     # EBU R128 broadcast target, -14 is the current Spotify/YouTube/
     # Amazon Music streaming standard. -9 is this app's own fixed ceiling
     # (see _LUFS_RED_DB below), also drawn bold since it's just as much a
-    # real decision point. -19/-17 flank -14 for finer resolution right
-    # around it. Numbers only in the UI -- no text labels (see chat/
-    # CLAUDE.md for what each one means).
+    # real decision point. -19 flanks -14 for finer resolution right
+    # around it. Numbers only in the UI -- no text labels beyond the
+    # number itself.
     _LUFS_REF_TICKS = (-23.0, -19.0, -14.0, -9.0)
-    _LUFS_GRID = (-60, -40, -30, -17, -10, -5)
+    # -17 removed per the user's explicit correction -- everything else
+    # in this grid stays exactly as it was; only that one value had no
+    # real meaning (it was just extra resolution flanking -14).
+    _LUFS_GRID = (-60, -40, -30, -10, -5)
     # Fixed, not adjustable: at/above this the *entire* fill goes solid
     # red, all the way down -- past this point the signal is almost
     # certainly being compressed/limited, worth flagging unmistakably
@@ -942,8 +1078,9 @@ class Renderer:
 
         if floor_db <= self.lufs_alert_threshold <= ceil_db:
             ty = y_for(self.lufs_alert_threshold)
-            pygame.draw.line(surface, theme.ACCENT, (inner.x - 2, ty), (inner.right + 2, ty), width=2)
-            thr_label = self._text(self.font_xs, f"{self.lufs_alert_threshold:.0f}", theme.ACCENT)
+            accent = self.chrome_accent()
+            pygame.draw.line(surface, accent, (inner.x - 2, ty), (inner.right + 2, ty), width=2)
+            thr_label = self._text(self.font_xs, f"{self.lufs_alert_threshold:.0f}", accent)
             label_x = inner.x - 4 - thr_label.get_width()
             if label_x >= rect.x:
                 surface.blit(thr_label, (label_x, ty - thr_label.get_height() // 2))
@@ -1029,34 +1166,117 @@ class Renderer:
         pygame.draw.line(surface, outline, (bx, by - half), (bx, by + half), width=2)
 
     def _draw_eq_icon(self, surface, rect):
-        """Small EQ-bars glyph, vector primitives -- for the compact-mode
-        toggle button, after the reference image the user sent (a
-        graphic-EQ silhouette)."""
-        heights = (0.35, 0.65, 1.0, 0.5, 0.8)
+        """Bar-chart glyph -- for the compact-mode toggle button, after
+        the reference chart image, minus the frame/grid: the user tried
+        it framed and found the surrounding square "estranho", so this is
+        just the 3 bars on their own. Monochrome (chrome_accent()) so it
+        follows the active eq_color_theme, same as every other icon here.
+        """
+        color = self.chrome_accent()
+        heights = (0.35, 0.65, 1.0)
         n = len(heights)
-        pad = 3
-        gap = 2
+        pad = max(2, int(rect.width * 0.14))
+        gap = max(1, int(rect.width * 0.10))
         bar_w = (rect.width - pad * 2 - gap * (n - 1)) / n
         base = rect.bottom - pad
         for i, hfrac in enumerate(heights):
             bh = max(2, (rect.height - pad * 2) * hfrac)
             x = rect.x + pad + i * (bar_w + gap)
             bar_rect = pygame.Rect(int(x), int(base - bh), max(1, int(bar_w)), int(bh))
-            pygame.draw.rect(surface, theme.GOLD, bar_rect, border_radius=1)
+            pygame.draw.rect(surface, color, bar_rect, border_radius=1)
 
     def _draw_lock_icon(self, surface, rect):
-        """Small padlock glyph, vector primitives -- for the
-        always-on-top toggle button, after the reference padlock image."""
-        cx = rect.centerx
-        body_w = rect.width * 0.55
-        body_h = rect.height * 0.4
+        """Padlock glyph, vector primitives -- for the always-on-top toggle
+        button, after the reference padlock images (orange body, gray
+        shackle, dark keyhole). Always drawn closed -- the user tried an
+        animated open/closed version and preferred a plain static glyph.
+        """
+        outline = (28, 20, 14)
+        body_color = self.chrome_accent()
+        body_w = rect.width * 0.62
+        body_h = rect.height * 0.46
         body_rect = pygame.Rect(0, 0, int(body_w), int(body_h))
-        body_rect.midtop = (cx, int(rect.centery))
-        pygame.draw.rect(surface, theme.GOLD, body_rect, border_radius=2)
-        shackle_r = max(2, int(body_w * 0.4))
-        shackle_rect = pygame.Rect(0, 0, shackle_r * 2, shackle_r * 2)
-        shackle_rect.midbottom = (cx, body_rect.top + 2)
-        pygame.draw.arc(surface, theme.GOLD, shackle_rect, 0, math.pi, width=max(2, int(rect.width * 0.14)))
+        body_rect.midtop = (rect.centerx, int(rect.centery - rect.height * 0.02))
+        pygame.draw.rect(surface, body_color, body_rect, border_radius=max(2, int(rect.width * 0.08)))
+        pygame.draw.rect(surface, outline, body_rect, width=1, border_radius=max(2, int(rect.width * 0.08)))
+
+        # Keyhole: circle + tapered slot beneath it.
+        kh_cx = body_rect.centerx
+        kh_cy = body_rect.centery - int(body_h * 0.08)
+        kh_r = max(1, int(body_h * 0.16))
+        pygame.draw.circle(surface, outline, (kh_cx, kh_cy), kh_r)
+        slot_rect = pygame.Rect(0, 0, max(1, int(kh_r * 0.8)), max(2, int(body_h * 0.24)))
+        slot_rect.midtop = (kh_cx, kh_cy)
+        pygame.draw.rect(surface, outline, slot_rect)
+
+        # Shackle: straight U (left leg / arc / right leg), both legs
+        # anchored down into the body -- closed, static.
+        leg_gap = body_w * 0.5
+        leg_len = rect.height * 0.30
+        shackle_r = leg_gap / 2.0
+        cx = body_rect.centerx
+        top_y = body_rect.top + 2 - leg_len
+        n_arc = 10
+        pts = [(int(cx - leg_gap / 2), int(body_rect.top + 2))]
+        pts.append((int(cx - leg_gap / 2), int(top_y)))
+        for i in range(n_arc + 1):
+            a = math.pi - (math.pi * i / n_arc)
+            pts.append((int(cx + shackle_r * math.cos(a)), int(top_y - shackle_r * math.sin(a))))
+        pts.append((int(cx + leg_gap / 2), int(top_y)))
+        pts.append((int(cx + leg_gap / 2), int(body_rect.top + 2)))
+
+        width = max(2, int(rect.width * 0.13))
+        # Light silver reads fine on every dark theme's panel background,
+        # but nearly disappears against brndz's light beige -- confirmed
+        # by the user ("ficou apagado, ficou estranho"). Dark brown/black
+        # there instead, same contrast logic as GOLD/OK/WARN's brndz-only
+        # overrides in sync_theme_module().
+        shackle_color = (46, 28, 20) if self.eq_color_theme == "brndz" else (196, 200, 206)
+        pygame.draw.lines(surface, shackle_color, False, pts, width=width)
+        for p in (pts[0], pts[-1]):
+            pygame.draw.circle(surface, shackle_color, p, width // 2)
+
+    def _draw_control_panel_icon(self, surface, rect, visible: bool = True):
+        """Control-panel glyph -- 3 stacked sliders (thin track + small
+        square handle, each at a different position), after the
+        reference image (fader-style sliders with small rectangular
+        handles). Round handles read as too bold/blobby at icon scale --
+        replaced with small squares, thinner lines overall, closer to the
+        reference's plain-line-and-square look. Hidden state gets a
+        diagonal slash through the whole glyph -- same show/hide
+        convention as the rest of this header. chrome_accent() so it
+        follows the active eq_color_theme.
+        """
+        color = self.chrome_accent()
+        cx, cy = rect.center
+
+        pad_x = max(2, int(rect.width * 0.14))
+        x0 = rect.x + pad_x
+        x1 = rect.right - pad_x
+        line_w = max(1, int(rect.height * 0.06))
+        knob_w = max(2, int(rect.width * 0.13))
+        knob_h = max(4, int(rect.height * 0.32))
+        rows = ((0.26, 0.30), (0.5, 0.82), (0.74, 0.46))  # (row_y_frac, knob_x_frac)
+        for row_frac, knob_frac in rows:
+            y = rect.y + int(rect.height * row_frac)
+            pygame.draw.line(surface, color, (x0, y), (x1, y), width=line_w)
+            kx = x0 + int((x1 - x0) * knob_frac)
+            knob_rect = pygame.Rect(0, 0, knob_w, knob_h)
+            knob_rect.center = (kx, y)
+            pygame.draw.rect(surface, color, knob_rect, border_radius=1)
+
+        if not visible:
+            lw = max(2, int(rect.height * 0.14))
+            half = int(min(rect.width, rect.height) * 0.46)
+            pygame.draw.line(surface, color, (cx - half, cy - half), (cx + half, cy + half), width=lw)
+
+    # True ROYGBIV-ish spread (not any single theme's own gradient) so the
+    # palette-button icon reads as "rainbow" at a glance instead of just
+    # looking like whichever real palette the fallback (_COLOR_STOPS,
+    # "quente") happened to resolve to -- "rainbow" isn't a real entry in
+    # _EQ_COLOR_STOPS, so without this special case the icon looked
+    # identical to the "quente" one, confirmed confusing by the user.
+    _RAINBOW_DOT_COLORS = ((220, 55, 55), (230, 140, 30), (70, 195, 80), (50, 140, 230), (160, 70, 210))
 
     def _draw_palette_icon(self, surface, rect):
         """Palette + paint-dots glyph, vector primitives -- replaces the
@@ -1066,49 +1286,20 @@ class Renderer:
         the icon showing that palette's own colors reads as self-
         explanatory rather than decorative.
         """
+        is_rainbow = self.eq_color_theme == "rainbow"
         stops = _EQ_COLOR_STOPS.get(self.eq_color_theme, _COLOR_STOPS)
         cx, cy = rect.center
         r = min(rect.width, rect.height) * 0.36
         pygame.draw.circle(surface, theme.PANEL_BORDER, (cx, cy), int(r), width=1)
         dot_positions = ((-0.35, -0.3), (0.15, -0.42), (0.42, 0.0), (0.18, 0.35), (-0.3, 0.3))
         for i, (dx, dy) in enumerate(dot_positions):
-            frac = i / max(1, len(dot_positions) - 1)
-            color = _bar_color_themed(frac, stops)
+            if is_rainbow:
+                color = self._RAINBOW_DOT_COLORS[i % len(self._RAINBOW_DOT_COLORS)]
+            else:
+                frac = i / max(1, len(dot_positions) - 1)
+                color = _bar_color_themed(frac, stops)
             dot_r = max(1, int(r * 0.32))
             pygame.draw.circle(surface, color, (int(cx + dx * r), int(cy + dy * r)), dot_r)
-
-    def _draw_hollow_text(self, surface, font, text, pos, outline_color, fill_color):
-        """Outline-only ("vazada") text: no native outline mode in
-        pygame's font renderer, so this fakes it -- render solid in
-        `outline_color` at 8 offsets around the target position (builds
-        a ring), then render once more in `fill_color` dead-center
-        (erases the middle back to the button's own fill, leaving only
-        the ring/edges showing)."""
-        x, y = pos
-        outline_img = font.render(text, True, outline_color)
-        for dx in (-1, 0, 1):
-            for dy in (-1, 0, 1):
-                if dx == 0 and dy == 0:
-                    continue
-                surface.blit(outline_img, (x + dx, y + dy))
-        inner_img = font.render(text, True, fill_color)
-        surface.blit(inner_img, (x, y))
-
-    def _draw_mini_fader_icon(self, surface, rect):
-        """Tiny 3-fader-bank glyph for the MIXER button -- a track per
-        channel + a knob at a different height on each, just enough to
-        read as "mixer" at a glance without needing the real thing built
-        yet. Drawn in theme.BG (dark) against the button's own gradient
-        fill, same convention as the hollow "MIXER" text next to it."""
-        n = 3
-        gap = 3
-        track_w = max(1, (rect.width - gap * (n - 1)) // n)
-        knob_fracs = (0.35, 0.7, 0.5)
-        for i in range(n):
-            cx = rect.x + i * (track_w + gap) + track_w // 2
-            pygame.draw.line(surface, theme.BG, (cx, rect.y), (cx, rect.bottom), width=2)
-            ky = rect.bottom - int(rect.height * knob_fracs[i])
-            pygame.draw.circle(surface, theme.BG, (cx, ky), 3)
 
     def _draw_audio_io_panel(self, surface, rect, audio_io, recording, mic_recording=None):
         self._panel_rect(surface, rect, "ÁUDIO I/O")
@@ -1128,7 +1319,6 @@ class Renderer:
         y = 34
         roomy = rect.width >= 150
         btn_h = 24
-        stops = _EQ_COLOR_STOPS.get(self.eq_color_theme, _COLOR_STOPS)
 
         inp = audio_io.input if audio_io is not None else None
         in_connected = bool(inp is not None and inp.connected)
@@ -1182,32 +1372,30 @@ class Renderer:
         self._draw_rec_badge(surface, self.rec_button_rect, rec_active, rec_text)
         y += btn_h + 10
 
-        # MIXER: placeholder only, no function yet -- just claiming its
-        # spot in the layout for a later session. Gradient fill (the same
-        # low->high theme colors as the EQ bars, not a flat color) + a
-        # tiny fader-bank glyph + hollow/outline letters -- deliberately
-        # more ornate than every other button here, so it reads as
-        # "something bigger lives behind this" without needing a text
-        # label saying so.
-        mixer_h = 28
-        if y + mixer_h <= rect.bottom - 8:
-            r = pygame.Rect(rect.x + 10, rect.bottom - 8 - mixer_h, rect.width - 20, mixer_h)
-            self.mixer_button_rect = r
-            for gx in range(r.width):
-                frac = gx / max(1, r.width - 1)
-                pygame.draw.line(surface, _bar_color_themed(frac, stops), (r.x + gx, r.y), (r.x + gx, r.bottom - 1))
-            pygame.draw.rect(surface, theme.TEXT, r, width=1, border_radius=6)
-
-            icon_rect = pygame.Rect(r.x + 10, r.y + 5, 26, r.height - 10)
-            self._draw_mini_fader_icon(surface, icon_rect)
-
-            mid_color = _bar_color_themed(0.5, stops)
-            label_img = self.font_label_bold.render("MIXER", True, theme.BG)
-            label_x = icon_rect.right + 10
-            label_y = r.centery - label_img.get_height() // 2
-            self._draw_hollow_text(surface, self.font_label_bold, "MIXER", (label_x, label_y), theme.BG, mid_color)
+        # Two side-by-side buttons share this row now: "Configurações
+        # Avançadas" (opens Windows' own per-app volume mixer directly,
+        # ms-settings:apps-volume -- renamed from "MIXER" since it just
+        # opens a settings page now, doesn't mix anything itself) and
+        # "STREAMING" (opens the YouTube-metrics dashboard window, same
+        # separate-process/resizable-window pattern the old MIXER window
+        # used). Plain style, same as every other simple action button in
+        # this panel (Flush DNS, Mapear Rede).
+        if y + btn_h <= rect.bottom - 8:
+            gap = 8
+            half_w = (rect.width - 20 - gap) // 2
+            settings_r = pygame.Rect(rect.x + 10, y, half_w, btn_h)
+            streaming_r = pygame.Rect(settings_r.right + gap, y, rect.width - 20 - half_w - gap, btn_h)
+            self.mixer_button_rect = settings_r
+            self.streaming_button_rect = streaming_r
+            for r, text in ((settings_r, "Config. Avançadas"), (streaming_r, "STREAMING")):
+                pygame.draw.rect(surface, theme.PANEL_BG, r, border_radius=5)
+                pygame.draw.rect(surface, self.chrome_accent(), r, width=1, border_radius=5)
+                label_text = self._truncate(self.font_row, text, r.width - 10)
+                label = self._text(self.font_row, label_text, self.chrome_accent())
+                surface.blit(label, label.get_rect(center=r.center))
         else:
             self.mixer_button_rect = pygame.Rect(0, 0, 0, 0)
+            self.streaming_button_rect = pygame.Rect(0, 0, 0, 0)
 
     def _draw_log_box(self, surface, rect, log_events, bottom_y):
         """Recent-activity strip: a dedicated header row (title + a rule,
@@ -1645,10 +1833,15 @@ class Renderer:
             surface.blit(img, (plot.centerx - img.get_width() // 2, plot.centery - img.get_height() // 2))
 
     def _draw_watermark(self, surface, rect):
-        # Fixed wine, not themed -- only the EQ/LUFS meter follow the
-        # color cycle, everything else (including this) stays put.
+        # Follows eq_color_theme via chrome_accent(), same as titles/
+        # buttons/MIXER -- the cache key has to include the theme too, or
+        # the first-rendered color sticks in the cached Surface forever
+        # (rect.width/height alone don't change on a theme switch, so the
+        # cache never invalidated -- confirmed by the user: the watermark
+        # visibly stayed amber in a screenshot taken after switching to a
+        # blue theme, while everything else around it changed color).
         watermark_color = self.chrome_accent()
-        key = (rect.width, rect.height)
+        key = (rect.width, rect.height, self.eq_color_theme)
         if key != self._watermark_key:
             size = max(28, int(rect.height * 0.34))
             font_path = _watermark_font_path()
@@ -1825,7 +2018,32 @@ class Renderer:
             return
 
         w, h = surface.get_size()
-        stops = _EQ_COLOR_STOPS.get(self.eq_color_theme, _COLOR_STOPS)
+        rainbow = self.eq_color_theme == "rainbow"
+        if rainbow:
+            from_key, to_key, rainbow_sweep = self._rainbow_state()
+            from_stops = _EQ_COLOR_STOPS.get(from_key, _COLOR_STOPS)
+            to_stops = _EQ_COLOR_STOPS.get(to_key, _COLOR_STOPS)
+
+            def blended(frac, amt):
+                # Crossfades between the two palettes' own colors at the
+                # same height-fraction, instead of a hard on/off switch --
+                # measured at ~0.3ms/frame for a full 28-bar EQ (under 2%
+                # of a 60fps frame budget), negligible, and only runs
+                # during the ~2s wipe of an active rainbow cycle.
+                c1 = _bar_color_themed(frac, from_stops)
+                c2 = _bar_color_themed(frac, to_stops)
+                amt = max(0.0, min(1.0, amt))
+                return tuple(int(c1[k] + (c2[k] - c1[k]) * amt) for k in range(3))
+
+            # LUFS strip leads the sweep (reaches the new palette at 62.5%
+            # of the wipe instead of 100%) -- it sits to the left of the
+            # bars, so it's supposed to visibly go first, not lag behind
+            # until the whole cycle resets (the user's explicit
+            # correction: "a cor do LUFS é a última a mudar, ela deve ser
+            # a primeira").
+            lufs_blend = min(1.0, rainbow_sweep * 1.6)
+        else:
+            stops = _EQ_COLOR_STOPS.get(self.eq_color_theme, _COLOR_STOPS)
 
         # LUFS VU strip, left edge -- deliberately a *solid* single tone
         # below -19 (not the EQ bars' own low->high gradient, which the
@@ -1850,13 +2068,15 @@ class Renderer:
                 if lufs >= self._LUFS_RED_DB:
                     pygame.draw.rect(surface, theme.BAR_CLIP, pygame.Rect(2, y_current, lufs_w, fill_h))
                 else:
-                    pygame.draw.rect(surface, _bar_color_themed(0.4, stops), pygame.Rect(2, y_current, lufs_w, fill_h))
+                    fill_color = blended(0.4, lufs_blend) if rainbow else _bar_color_themed(0.4, stops)
+                    pygame.draw.rect(surface, fill_color, pygame.Rect(2, y_current, lufs_w, fill_h))
                     if lufs >= self._LUFS_COMPACT_TONE_DB:
                         tone_frac = max(0.0, min(1.0, (self._LUFS_COMPACT_TONE_DB - floor_db) / span))
                         y_tone = int(h - h * tone_frac)
                         tone_rect = pygame.Rect(2, y_current, lufs_w, max(0, y_tone - y_current))
                         if tone_rect.height > 0:
-                            pygame.draw.rect(surface, _bar_color_themed(1.0, stops), tone_rect)
+                            tone_color = blended(1.0, lufs_blend) if rainbow else _bar_color_themed(1.0, stops)
+                            pygame.draw.rect(surface, tone_color, tone_rect)
 
         for ref_db in (self._LUFS_COMPACT_TONE_DB, self._LUFS_RED_DB):
             if ref_db < floor_db or ref_db > ceil_db:
@@ -1873,27 +2093,117 @@ class Renderer:
             bar_h = max(2, v * h)
             x = eq_x0 + gap + i * (bar_w + gap)
             rect = pygame.Rect(int(x), int(baseline - bar_h), max(1, int(bar_w)), int(bar_h))
-            pygame.draw.rect(surface, _bar_color_themed(v, stops), rect)
+            if rainbow:
+                # Left-to-right wipe: a bar's *position* (not its own
+                # height/loudness) decides which of the two palettes it's
+                # currently drawn in -- bars left of the sweep line have
+                # already turned into the next palette, the rest are still
+                # the old one -- softened into a crossfade band (not a
+                # hard cut) so the wipe reads as fluid motion instead of
+                # bars snapping instantly as the line passes them. `v`
+                # still selects the shade *within* whichever palette, same
+                # as every other theme.
+                x_frac = i / max(1, n - 1)
+                # sweep_frac is exactly 0.0 during the hold (no wipe in
+                # progress) -- without this guard the feathered formula
+                # below still gives the leftmost bars a ~50% blend even
+                # then (it centers the feather ON the sweep line, and
+                # x_frac=0 sits right at that line when sweep=0), so the
+                # bars nearest the LUFS strip never fully settled on the
+                # "from" palette during a hold. Caught visually: two
+                # leftmost bars stayed green through an otherwise fully
+                # orange hold.
+                bar_blend = 0.0 if rainbow_sweep <= 0.0 else (rainbow_sweep - x_frac) / _RAINBOW_FEATHER + 0.5
+                color = blended(v, bar_blend)
+            else:
+                color = _bar_color_themed(v, stops)
+            pygame.draw.rect(surface, color, rect)
 
         if not self.spectrum_available:
             msg = self._text(self.font_xs, "sem áudio", theme.CRIT)
             surface.blit(msg, (eq_x0 + 4, 6))
 
-    def draw_compact_restore_button(self, surface):
+    def draw_compact_restore_button(self, surface, visible: bool = True):
+        # Invisible until hovered -- compact mode is meant to be a clean
+        # overlay of just the EQ; the close/move/theme buttons only need
+        # to exist for the moment the user is about to click one, per the
+        # user's explicit request ("ficar invisíveis e só aparecer se
+        # passar o mouse em cima, ficaria mais elegante"). `visible` is
+        # decided by the caller (main.py), which checks the mouse against
+        # the *whole 3-button cluster*, not just this one button's own
+        # rect -- hovering any of the 3 reveals all 3, per the user's
+        # follow-up ("quando passar o mouse por cima de qualquer botão,
+        # os 3 botões ficam visíveis"). The rect is still returned (and
+        # still clickable) even when not drawn -- only the chrome is
+        # conditional, not the hit target.
         size = 20
         rect = pygame.Rect(1, surface.get_height() - size - 1, size, size)
+        if not visible:
+            return rect
         pygame.draw.rect(surface, theme.PANEL_BG, rect)
         pygame.draw.rect(surface, theme.PANEL_BORDER, rect, width=1)
         label = self._text(self.font_md, "x", theme.TEXT)
         surface.blit(label, label.get_rect(center=rect.center))
         return rect
 
-    def draw_theme_button(self, surface, rect):
-        """"C" button -- used in both the main panel header (next to the
-        status widget) and compact mode (next to the close button). Cycles
-        eq_color_theme through _EQ_THEME_ORDER on click (main.py handles
-        the click, this only draws); caller positions `rect`.
+    def draw_move_icon_button(self, surface, rect, visible: bool = True):
+        """Dedicated drag handle for compact mode -- a frameless window has
+        no title bar, and the user found grabbing blank space among the EQ
+        bars to drag it unreliable. Doesn't add any new drag *logic*
+        (main.py already starts a window drag on any click that isn't the
+        close/theme buttons; this rect falls into that same catch-all) --
+        it's purely a discoverable, explicitly-labeled place to grab,
+        hidden until hovered same as the other 2 compact buttons."""
+        if not visible:
+            return rect
+        pygame.draw.rect(surface, theme.PANEL_BG, rect)
+        pygame.draw.rect(surface, theme.PANEL_BORDER, rect, width=1)
+        self._draw_move_icon(surface, rect)
+        return rect
+
+    def _draw_move_icon(self, surface, rect):
+        """Standard "move" glyph -- 4 arrows radiating from the center
+        toward the 4 diagonal corners, after the reference (the classic
+        OS move-cursor shape, diagonal variant). In the "rainbow" theme
+        each of the 4 arrows gets its own distinct hue (reusing
+        _RAINBOW_DOT_COLORS) instead of chrome_accent() -- which falls
+        back to plain "quente" orange for every arrow, since "rainbow"
+        isn't a real entry in _EQ_COLOR_STOPS. A single-color rainbow
+        icon didn't read as "rainbow" at all; one color per arrow does.
         """
+        cx, cy = rect.center
+        arm = min(rect.width, rect.height) * 0.42
+        head_len = arm * 0.42
+        head_w = arm * 0.34
+        shaft_w = max(1, int(rect.width * 0.10))
+        diag = 0.7071067811865476
+        is_rainbow = self.eq_color_theme == "rainbow"
+        accent = self.chrome_accent()
+        for i, (dx, dy) in enumerate(((diag, diag), (diag, -diag), (-diag, diag), (-diag, -diag))):
+            color = self._RAINBOW_DOT_COLORS[i] if is_rainbow else accent
+            px, py = -dy, dx  # unit vector perpendicular to (dx, dy)
+            shaft_start = (cx + dx * arm * 0.18, cy + dy * arm * 0.18)
+            tip = (cx + dx * arm, cy + dy * arm)
+            shaft_end = (tip[0] - dx * head_len, tip[1] - dy * head_len)
+            pygame.draw.line(surface, color, shaft_start, shaft_end, width=shaft_w)
+            base1 = (shaft_end[0] + px * head_w * 0.5, shaft_end[1] + py * head_w * 0.5)
+            base2 = (shaft_end[0] - px * head_w * 0.5, shaft_end[1] - py * head_w * 0.5)
+            pygame.draw.polygon(surface, color, [tip, base1, base2])
+
+    def draw_theme_button(self, surface, rect, visible: bool = True):
+        """"C" button -- used in both the main panel header (next to the
+        status widget) and compact mode (next to the close/move buttons).
+        Cycles eq_color_theme through _EQ_THEME_ORDER on click (main.py
+        handles the click, this only draws); caller positions `rect`.
+
+        `visible` (compact mode only -- the main panel always uses the
+        default True) hides the button chrome entirely when False, same
+        "invisible until the 3-button cluster is hovered" treatment as
+        draw_compact_restore_button/draw_move_icon_button. The rect is
+        still returned/clickable either way.
+        """
+        if not visible:
+            return rect
         pygame.draw.rect(surface, theme.PANEL_BG, rect)
         pygame.draw.rect(surface, theme.PANEL_BORDER, rect, width=1)
         self._draw_palette_icon(surface, rect)
@@ -1909,14 +2219,65 @@ class Renderer:
 
     def draw_topmost_toggle_icon_button(self, surface, rect, active: bool):
         """Small icon button replacing the "Sempre no topo" text button --
-        padlock glyph, after the user's reference image. `active`
-        (already pinned) gets the accent border, same convention as
-        every other toggle button in this header."""
+        padlock glyph, after the user's reference images. Always drawn
+        closed (no shackle animation -- the user tried the animated
+        open/closed version and preferred a plain static glyph); `active`
+        (already pinned) just gets the accent border/ring, same convention
+        as every other toggle button in this header.
+        """
         pygame.draw.rect(surface, theme.PANEL_BG, rect)
         pygame.draw.rect(surface, self.chrome_accent() if active else theme.PANEL_BORDER, rect, width=2 if active else 1)
         self._draw_lock_icon(surface, rect)
         return rect
 
-    def cycle_eq_color_theme(self):
-        idx = _EQ_THEME_ORDER.index(self.eq_color_theme) if self.eq_color_theme in _EQ_THEME_ORDER else 0
-        self.eq_color_theme = _EQ_THEME_ORDER[(idx + 1) % len(_EQ_THEME_ORDER)]
+    def draw_visibility_toggle_icon_button(self, surface, rect, hidden: bool):
+        """Small icon button replacing the "Ocultar painel"/"Mostrar
+        painel" text button -- gear+slider "control panel" glyph, after
+        the user's reference image (the eye metaphor didn't fit what this
+        button actually does). `hidden` (panels currently collapsed) gets
+        the accent border, same convention as the other toggle buttons,
+        and draws the slashed variant."""
+        pygame.draw.rect(surface, theme.PANEL_BG, rect)
+        pygame.draw.rect(surface, self.chrome_accent() if hidden else theme.PANEL_BORDER, rect, width=2 if hidden else 1)
+        self._draw_control_panel_icon(surface, rect, visible=not hidden)
+        return rect
+
+    def _rainbow_state(self):
+        """Advances and returns the "rainbow" compact-mode animation:
+        (from_theme_key, to_theme_key, sweep_frac). Holds fully on
+        `from_theme_key` for _RAINBOW_HOLD_S, then wipes left-to-right
+        into `to_theme_key` over _RAINBOW_WIPE_S (sweep_frac 0->1), then
+        advances to the next palette in _EQ_THEME_ORDER and repeats --
+        cycling through all 6 real palettes forever, never landing on
+        "rainbow" itself as a target (that's the mode, not a palette).
+        """
+        now = time.time()
+        if self._rainbow_phase_start is None:
+            self._rainbow_phase_start = now
+        elapsed = now - self._rainbow_phase_start
+        cycle_len = _RAINBOW_HOLD_S + _RAINBOW_WIPE_S
+        if elapsed >= cycle_len:
+            n = len(_EQ_THEME_ORDER)
+            self._rainbow_from_idx = self._rainbow_to_idx
+            self._rainbow_to_idx = (self._rainbow_to_idx + 1) % n
+            self._rainbow_phase_start = now
+            elapsed = 0.0
+        if elapsed < _RAINBOW_HOLD_S:
+            sweep_frac = 0.0
+        else:
+            sweep_frac = (elapsed - _RAINBOW_HOLD_S) / _RAINBOW_WIPE_S
+        return _EQ_THEME_ORDER[self._rainbow_from_idx], _EQ_THEME_ORDER[self._rainbow_to_idx], sweep_frac
+
+    def cycle_eq_color_theme(self, allow_rainbow: bool = False):
+        """`allow_rainbow` is only passed True from compact mode's own
+        theme button -- "rainbow" is a compact-mode-exclusive extra entry
+        appended after the 6 real palettes, not reachable by cycling from
+        the main panel. If "rainbow" is somehow the current value when
+        cycling without allow_rainbow (e.g. the user switched to the main
+        panel and clicked its theme button), it isn't in the short list,
+        so this naturally falls back to index 0 and advances from there --
+        equivalent to leaving rainbow mode.
+        """
+        order = _EQ_THEME_ORDER_COMPACT if allow_rainbow else _EQ_THEME_ORDER
+        idx = order.index(self.eq_color_theme) if self.eq_color_theme in order else 0
+        self.eq_color_theme = order[(idx + 1) % len(order)]

@@ -15,12 +15,12 @@ import pygame
 
 from avmonitor.config import load_config, default_config_path
 from avmonitor.audio_spectrum import AudioSpectrumAnalyzer, SpectrumFrame, list_output_devices
-from avmonitor.audio_io import AudioIOMonitor
+from avmonitor.audio_io import AudioIOMonitor, list_input_devices
 from avmonitor.audio_recorder import AudioRecorder, resolve_recording_dir
 from avmonitor.system_stats import SystemStatsMonitor
 from avmonitor.network_monitor import NetworkMonitor
 from avmonitor.process_watch import ProcessWatcher
-from avmonitor.session_log import SessionLogger, resolve_log_dir
+from avmonitor.session_log import SessionLogger, resolve_log_dir, cleanup_old_reports
 from avmonitor.ui.renderer import Renderer
 from avmonitor.ui import theme
 from avmonitor.util import drain_all
@@ -32,11 +32,11 @@ from avmonitor import win_native
 HEADER_H = 44
 
 # All positioned per-frame, right-to-left (see _layout_buttons in the draw loop).
-STOP_BUTTON_RECT = pygame.Rect(0, 0, 150, 32)
-COLLAPSE_BUTTON_RECT = pygame.Rect(0, 0, 150, 32)
 TOPMOST_BUTTON_RECT = pygame.Rect(0, 0, 150, 32)
 COMPACT_BUTTON_RECT = pygame.Rect(0, 0, 150, 32)
-DEVICE_BUTTON_RECT = pygame.Rect(0, 0, 380, 32)
+VISIBILITY_BUTTON_RECT = pygame.Rect(0, 0, 150, 32)
+DEVICE_BUTTON_RECT = pygame.Rect(0, 0, 260, 32)
+INPUT_DEVICE_BUTTON_RECT = pygame.Rect(0, 0, 260, 32)
 
 DEVICE_ROW_H = 26
 DEVICE_LIST_MAX_ROWS = 8
@@ -57,6 +57,23 @@ def _app_dir() -> Path:
     if getattr(sys, "frozen", False):
         return Path(sys.executable).resolve().parent
     return Path(__file__).resolve().parent
+
+
+def _initial_window_size(cfg) -> "tuple[int, int]":
+    """Sized proportional to the actual screen the app is launching on
+    (78% width / 82% height, clamped to a sane minimum and never wider/
+    taller than the screen itself) instead of always the same fixed
+    default -- 1280x800 could be cramped on a small field-monitor laptop
+    or tiny on a 4K rig. Falls back to cfg.window_width/height if the
+    screen resolution can't be read for any reason.
+    """
+    screen_size = win_native.get_screen_size()
+    if not screen_size:
+        return cfg.window_width, cfg.window_height
+    sw, sh = screen_size
+    w = max(1000, min(int(sw * 0.78), sw - 80))
+    h = max(650, min(int(sh * 0.82), sh - 80))
+    return w, h
 
 
 def _resource_path(name: str) -> Path:
@@ -106,6 +123,70 @@ def _launch_network_mapper(logger=None):
     except Exception as e:
         if logger:
             logger.add_event(f"Falha ao iniciar Mapa de Rede: {e}", level="ERROR", source="NETWORK", event="NETWORK_MAP_ERROR")
+
+
+def _launch_streaming(logger=None):
+    if getattr(sys, "frozen", False):
+        args = [sys.executable, "--streaming"]
+    else:
+        args = [sys.executable, str(Path(__file__).resolve()), "--streaming"]
+    try:
+        subprocess.Popen(args, cwd=str(_app_dir()), creationflags=_CREATE_NO_WINDOW, close_fds=True)
+        if logger:
+            logger.add_event("STREAMING iniciado", level="OK", source="AUDIO", event="STREAMING_START")
+    except Exception as e:
+        if logger:
+            logger.add_event(f"Falha ao iniciar STREAMING: {e}", level="ERROR", source="AUDIO", event="STREAMING_ERROR")
+
+
+def _pin_settings_window_topmost():
+    """Windows' own Settings app ("Configurações") opens as a normal
+    (non-topmost) window -- if this app's own window (or STREAMING's) is
+    pinned always-on-top, Settings could never render above it no matter
+    how much focus it gets (SetForegroundWindow doesn't let a normal
+    window rise above a topmost one). Runs on its own daemon thread.
+
+    Pinning it once wasn't reliably enough -- this app's own periodic
+    HWND_TOPMOST reassertion tries to defer to Settings once it's
+    detected, but there's a real race window between Settings opening
+    and this thread finding+pinning it (up to ~5s of polling) during
+    which the OTHER window's own reassert cycle can still win a claim.
+    Pinning is explicit priority the user asked for ("prioridade
+    máxima, mesmo que o always on top das outras janelas esteja
+    ativo") -- so this keeps re-claiming the front spot for Settings
+    every 0.5s for as long as it stays open, closing that race instead
+    of just reducing its odds. Exits on its own once Settings closes.
+    """
+    hwnd = None
+    deadline = time.time() + 5.0
+    while hwnd is None and time.time() < deadline:
+        time.sleep(0.2)
+        hwnd = win_native.find_window_containing("Configurações")
+    if hwnd is None:
+        return
+    while True:
+        win_native.set_always_on_top(hwnd, True)
+        time.sleep(0.5)
+        if win_native.find_window_containing("Configurações") is None:
+            return
+
+
+def _open_windows_mixer(logger=None):
+    """The MIXER button used to open a whole custom window (its own
+    per-app volume/mute faders) -- dropped in favor of just opening
+    Windows' own per-app volume mixer directly (ms-settings:apps-volume,
+    the same page "Config. de som do Windows" used to link to from
+    inside that window). It already has everything the custom window
+    offered, no reason to maintain a second, smaller version of it.
+    """
+    try:
+        subprocess.Popen(["cmd", "/c", "start", "", "ms-settings:apps-volume"], shell=False)
+        threading.Thread(target=_pin_settings_window_topmost, daemon=True).start()
+        if logger:
+            logger.add_event("Config. de som do Windows aberta", level="OK", source="AUDIO", event="MIXER_START")
+    except Exception as e:
+        if logger:
+            logger.add_event(f"Falha ao abrir config. de som: {e}", level="ERROR", source="AUDIO", event="MIXER_ERROR")
 
 
 def _launch_task_manager(logger=None):
@@ -199,12 +280,30 @@ def _start_folder_browse(initial_dir: str) -> "queue.Queue[str | None]":
     return q
 
 
+_truncate_text_cache: "dict[tuple, str]" = {}
+
+
 def _truncate_text(font, text, max_w):
+    # Cached -- same reasoning as Renderer._truncate: most button labels
+    # (device names, etc.) are identical from one frame to the next, so
+    # re-measuring/re-shrinking them with font.size() every frame at 60fps
+    # is pure waste. font.size() showed up as the single biggest chunk of
+    # render time in a profiled run.
+    key = (id(font), text, max_w)
+    cached = _truncate_text_cache.get(key)
+    if cached is not None:
+        return cached
+    if len(_truncate_text_cache) > 500:
+        _truncate_text_cache.clear()
     if font.size(text)[0] <= max_w:
-        return text
-    while text and font.size(text + "…")[0] > max_w:
-        text = text[:-1]
-    return f"{text}…" if text else "…"
+        result = text
+    else:
+        t = text
+        while t and font.size(t + "…")[0] > max_w:
+            t = t[:-1]
+        result = f"{t}…" if t else "…"
+    _truncate_text_cache[key] = result
+    return result
 
 
 def _draw_button(surface, font, rect, text, active=False, accent=theme.ACCENT):
@@ -249,7 +348,7 @@ def _compute_live_warn_level(cfg, stats, network, processes, spectrum_available)
     return False
 
 
-def _draw_status_widget(surface, font_label, font_value, x, y, height, level, uptime_text):
+def _draw_status_widget(surface, font_label, font_value, x, y, height, level, uptime_text, accent=theme.GOLD):
     """Status dot (green=ok/amber=warn/red=crit, click to acknowledge red)
     + "Tempo Online" uptime, filling the header gap between "Saída" and
     "Modo compacto". Returns (dot_rect, right_edge_x) -- dot_rect for click
@@ -271,7 +370,7 @@ def _draw_status_widget(surface, font_label, font_value, x, y, height, level, up
 
     text_x = dot_rect.right + 10
     label_img = font_label.render("TEMPO ONLINE", True, theme.TEXT_LABEL)
-    value_img = font_value.render(uptime_text, True, theme.GOLD)
+    value_img = font_value.render(uptime_text, True, accent)
     surface.blit(label_img, (text_x, cy - label_img.get_height() - 1))
     surface.blit(value_img, (text_x, cy + 1))
 
@@ -319,7 +418,17 @@ def _draw_device_dropdown(surface, font, anchor_rect, options, selected_name, ac
 
 def _enter_compact_mode(cfg, always_on_top):
     """Switches to a small frameless colorkey-transparent window showing
-    just the EQ, centered where the normal window was."""
+    just the EQ, centered where the normal window was. Always topmost
+    while active, regardless of the "sempre no topo" toggle -- explicit
+    request: the compact EQ overlay's whole purpose is staying visible
+    over other software (OBS/vMix/etc.), so it shouldn't need the toggle
+    turned on separately to do that. The toggle still governs the full
+    (non-compact) window on its own. The caption changes specifically so
+    STREAMING/Mapa de Rede (which otherwise mirror this window's own
+    always-on-top state and would then fight it for the front of the
+    z-order band) can tell compact mode is active and yield outright
+    instead -- see their own reassert-topmost blocks.
+    """
     old_hwnd = _get_hwnd()
     center = None
     if old_hwnd:
@@ -332,8 +441,8 @@ def _enter_compact_mode(cfg, always_on_top):
         win_native.enable_colorkey_transparency(hwnd, theme.COMPACT_COLORKEY)
         if center:
             win_native.move_window(hwnd, center[0] - cfg.compact_width // 2, center[1] - cfg.compact_height // 2)
-        if always_on_top:
-            win_native.set_always_on_top(hwnd, True)
+        pygame.display.set_caption("brndz.wav Monitor — Modo Compacto")
+        win_native.set_always_on_top(hwnd, True)
     return screen
 
 
@@ -342,6 +451,7 @@ def _exit_compact_mode(normal_size, always_on_top):
     hwnd = _get_hwnd()
     if hwnd:
         win_native.disable_layered(hwnd)
+        pygame.display.set_caption("brndz.wav Monitor")
         if always_on_top:
             win_native.set_always_on_top(hwnd, True)
     return screen
@@ -352,6 +462,27 @@ def _get_hwnd():
         return pygame.display.get_wm_info().get("window")
     except Exception:
         return None
+
+
+def _clamp_onscreen_if_lost(hwnd):
+    """Second layer of defense against the compact window ending up
+    somewhere with no visible monitor under it (see the dragging_window
+    safety net above for the main fix) -- if literally none of the
+    window's rect overlaps the primary screen after a drag ends, recenter
+    it there instead of leaving it stranded off-screen with no way back
+    except restarting the app. A no-op in the overwhelmingly common case
+    (window is somewhere reasonable)."""
+    if not hwnd:
+        return
+    screen_size = win_native.get_screen_size()
+    if not screen_size:
+        return
+    sw, sh = screen_size
+    l, t, r, b = win_native.get_window_rect(hwnd)
+    onscreen = pygame.Rect(0, 0, sw, sh).colliderect(pygame.Rect(l, t, max(1, r - l), max(1, b - t)))
+    if not onscreen:
+        w, h = max(1, r - l), max(1, b - t)
+        win_native.move_window(hwnd, (sw - w) // 2, (sh - h) // 2)
 
 
 def _toggle_recording(recorder, thread, logger, renderer, sample_rate, channels, label):
@@ -397,20 +528,53 @@ def main():
         pass
 
     cfg = load_config()
+    # always_on_top/compact_mode_active always start False in a fresh
+    # session (see the `always_on_top = False` local below -- neither is
+    # meant to persist across launches). But config.json itself can still
+    # have a stale True left over from the previous run (especially an
+    # unclean shutdown, which skips the exit-compact-mode write) -- and
+    # STREAMING/Mapa de Rede read this file fresh, cross-process, so a
+    # stale flag here would mislead them into thinking this window is
+    # topmost/compact when it genuinely isn't yet. Reset both to match
+    # reality before any derived window can read them.
+    if cfg.always_on_top or cfg.compact_mode_active:
+        cfg.always_on_top = False
+        cfg.compact_mode_active = False
+        cfg.save(default_config_path())
     logger = SessionLogger(cfg)
     logger.add_event("Startup iniciado", level="INFO", source="SYSTEM", event="STARTUP_BEGIN")
     logger.add_event(
         f"Modo: {'ADMIN' if win_native.is_admin() else 'USER'} | frozen={bool(getattr(sys, 'frozen', False))}",
         level="INFO", source="SYSTEM", event="STARTUP_ENV",
     )
+    removed_reports = cleanup_old_reports(logger.log_dir, max_age_days=90)
+    if removed_reports:
+        logger.add_event(
+            f"{removed_reports} relatório(s) de sessão com mais de 3 meses removido(s)",
+            level="INFO", source="SYSTEM", event="OLD_REPORTS_CLEANED",
+        )
 
-    pygame.init()
+    # pygame.init() initializes every subsystem, including pygame.mixer --
+    # which opens a real WASAPI *render* (output) stream. This app never
+    # plays a single pygame sound (alerts go through winsound.MessageBeep,
+    # a separate WinAPI call), so that stream served no purpose except
+    # registering this process as a live audio-rendering session in
+    # Windows' own volume mixer -- confirmed directly (pygame.mixer.get_init()
+    # returned a real (44100, -16, 2) stream after a bare pygame.init())
+    # after the user noticed the app itself showing up as a channel to
+    # control, which directly contradicts this project's own "it's a
+    # monitor, it should never generate audio" rule. Only the 2 subsystems
+    # actually used (display, font) are initialized instead of the
+    # blanket pygame.init().
+    pygame.display.init()
+    pygame.font.init()
     pygame.display.set_caption("brndz.wav Monitor")
     try:
         pygame.display.set_icon(pygame.image.load(_resource_path("brndz_icon_512.png")))
     except Exception:
         pass
-    screen = pygame.display.set_mode((cfg.window_width, cfg.window_height), pygame.RESIZABLE)
+    initial_window_size = _initial_window_size(cfg)
+    screen = pygame.display.set_mode(initial_window_size, pygame.RESIZABLE)
     clock = pygame.time.Clock()
 
     audio_q: "queue.Queue[SpectrumFrame]" = queue.Queue(maxsize=1)
@@ -443,6 +607,7 @@ def main():
     # call at startup is fine; re-enumerated on demand when the dropdown is
     # opened, in case something got plugged/unplugged mid-session.
     available_devices = list_output_devices()
+    available_input_devices = list_input_devices()
 
     renderer = Renderer(cfg)
 
@@ -468,15 +633,20 @@ def main():
     theme_button_rect = pygame.Rect(0, 0, 0, 0)
 
     compact_mode = False
-    normal_window_size = (cfg.window_width, cfg.window_height)
+    normal_window_size = initial_window_size
     dragging_window = False
     drag_offset = (0, 0)
     compact_restore_rect = pygame.Rect(0, 0, 0, 0)
+    compact_move_rect = pygame.Rect(0, 0, 0, 0)
     compact_theme_rect = pygame.Rect(0, 0, 0, 0)
 
     selected_device_name = None  # None = automatic (follow Windows default)
     device_dropdown_open = False
     dropdown_row_rects = []
+
+    selected_input_device_name = None  # None = automatic (follow Windows default)
+    input_device_dropdown_open = False
+    input_dropdown_row_rects = []
 
     confirm_exit_open = False
     audio_settings_browse_rect = pygame.Rect(0, 0, 0, 0)
@@ -511,6 +681,8 @@ def main():
                 elif compact_mode:
                     compact_mode = False
                     screen = _exit_compact_mode(normal_window_size, always_on_top)
+                    cfg.compact_mode_active = False
+                    cfg.save(default_config_path())
                 elif recorder.is_active() or mic_recorder.is_active():
                     confirm_exit_open = True
                 else:
@@ -584,8 +756,12 @@ def main():
                     if compact_restore_rect.collidepoint(event.pos):
                         compact_mode = False
                         screen = _exit_compact_mode(normal_window_size, always_on_top)
+                        cfg.compact_mode_active = False
+                        cfg.save(default_config_path())
                     elif compact_theme_rect.collidepoint(event.pos):
-                        renderer.cycle_eq_color_theme()
+                        renderer.cycle_eq_color_theme(allow_rainbow=True)
+                        cfg.eq_color_theme = renderer.eq_color_theme
+                        cfg.save(default_config_path())
                     else:
                         # No title bar to drag by -- track the grab offset in
                         # screen coordinates and reposition the window under
@@ -609,35 +785,62 @@ def main():
                             audio_thread.set_device_override(selected_device_name)
                             break
                     device_dropdown_open = False
-                elif STOP_BUTTON_RECT.collidepoint(event.pos):
-                    if recorder.is_active() or mic_recorder.is_active():
-                        confirm_exit_open = True
-                    else:
-                        running = False
+                elif input_device_dropdown_open:
+                    for i, row in enumerate(input_dropdown_row_rects):
+                        if row.collidepoint(event.pos):
+                            if i == 0:
+                                selected_input_device_name = None
+                            else:
+                                selected_input_device_name = available_input_devices[i - 1][1]
+                            audio_io_thread.set_device_override(selected_input_device_name)
+                            break
+                    input_device_dropdown_open = False
                 elif status_dot_rect.collidepoint(event.pos):
                     if status_critical_active:
                         status_critical_active = False
                         logger.add_event("Status crítico reconhecido pelo usuário", level="ACTION", source="SYSTEM", event="STATUS_ACK")
                 elif theme_button_rect.collidepoint(event.pos):
                     renderer.cycle_eq_color_theme()
-                elif COLLAPSE_BUTTON_RECT.collidepoint(event.pos):
+                    cfg.eq_color_theme = renderer.eq_color_theme
+                    cfg.save(default_config_path())
+                elif VISIBILITY_BUTTON_RECT.collidepoint(event.pos):
                     renderer.toggle_top_collapsed()
                 elif TOPMOST_BUTTON_RECT.collidepoint(event.pos):
                     always_on_top = not always_on_top
                     hwnd = _get_hwnd()
                     if hwnd:
                         win_native.set_always_on_top(hwnd, always_on_top)
+                    # Persisted so STREAMING/Mapa de Rede can read the
+                    # toggle's real state via config.json instead of
+                    # querying this window's live WS_EX_TOPMOST bit
+                    # cross-process -- see Config.always_on_top's docstring.
+                    cfg.always_on_top = always_on_top
+                    cfg.save(default_config_path())
                 elif COMPACT_BUTTON_RECT.collidepoint(event.pos):
                     compact_mode = True
                     device_dropdown_open = False
+                    input_device_dropdown_open = False
                     screen = _enter_compact_mode(cfg, always_on_top)
+                    cfg.compact_mode_active = True
+                    cfg.save(default_config_path())
                 elif DEVICE_BUTTON_RECT.collidepoint(event.pos):
                     device_dropdown_open = True
                     available_devices = list_output_devices()  # cheap-ish, catches plug/unplug
+                elif INPUT_DEVICE_BUTTON_RECT.collidepoint(event.pos):
+                    input_device_dropdown_open = True
+                    available_input_devices = list_input_devices()  # cheap-ish, catches plug/unplug
                 elif event.pos[1] >= HEADER_H and renderer.map_network_button_rect.collidepoint(
                     (event.pos[0], event.pos[1] - HEADER_H)
                 ):
                     _launch_network_mapper(logger)
+                elif event.pos[1] >= HEADER_H and renderer.mixer_button_rect.collidepoint(
+                    (event.pos[0], event.pos[1] - HEADER_H)
+                ):
+                    _open_windows_mixer(logger)
+                elif event.pos[1] >= HEADER_H and renderer.streaming_button_rect.collidepoint(
+                    (event.pos[0], event.pos[1] - HEADER_H)
+                ):
+                    _launch_streaming(logger)
                 elif event.pos[1] >= HEADER_H and renderer.flush_dns_button_rect.collidepoint(
                     (event.pos[0], event.pos[1] - HEADER_H)
                 ):
@@ -695,6 +898,7 @@ def main():
             elif event.type == pygame.MOUSEBUTTONUP and event.button == 1:
                 if compact_mode:
                     dragging_window = False
+                    _clamp_onscreen_if_lost(_get_hwnd())
                 else:
                     renderer.handle_mouse_up()
             elif event.type == pygame.MOUSEMOTION:
@@ -708,18 +912,53 @@ def main():
                     cw, ch = screen.get_size()
                     renderer.handle_mouse_motion((event.pos[0], event.pos[1] - HEADER_H), cw, ch - HEADER_H)
 
-        if always_on_top and time.time() >= reassert_topmost_at:
+        if dragging_window and not win_native.is_left_button_down():
+            # Safety net for a real bug reported in the field: a
+            # MOUSEBUTTONUP that happens while the cursor is outside this
+            # frameless window's small bounds isn't reliably delivered to
+            # the app, so the flag set on MOUSEBUTTONDOWN could never
+            # clear on its own -- every later MOUSEMOTION anywhere then
+            # kept dragging the window, which could send it off-screen
+            # with no way back short of restarting. Polling the real OS
+            # button state once a frame self-corrects regardless of
+            # whether the matching event ever arrives.
+            dragging_window = False
+            _clamp_onscreen_if_lost(_get_hwnd())
+
+        if (always_on_top or compact_mode) and time.time() >= reassert_topmost_at:
             # A one-time SetWindowPos can get buried under some other window
             # that *also* asks for topmost afterwards (z-order among topmost
             # windows still follows recency) -- reasserting periodically
             # wins that back instead of silently losing the "always on top"
-            # promise.
-            hwnd = _get_hwnd()
-            if hwnd:
-                win_native.set_always_on_top(hwnd, True)
+            # promise. Compact mode reasserts unconditionally (regardless
+            # of the "sempre no topo" toggle) -- explicit request: the
+            # compact EQ overlay should always stay the top layer while
+            # active, full stop.
+            #
+            # Exception: Windows' own Settings window (opened by the
+            # "Config. Avançadas" button) always gets absolute priority,
+            # no matter what. STREAMING and Mapa de Rede also mirror/claim
+            # topmost on their own periodic cadence (tracking this
+            # window's own toggle live -- see win_native.is_window_topmost()),
+            # so in normal (non-compact) mode with the toggle on, this
+            # window defers to them too ("most recently opened wins",
+            # same principle STREAMING applies to its own prompt dialogs)
+            # instead of fighting for the front spot every ~1.5s. Compact
+            # mode is the one case that does NOT defer to STREAMING/Mapa
+            # de Rede -- it's meant to stay in evidence over the app's
+            # own other windows too, not just third-party ones.
+            settings_open = win_native.find_window_containing("Configurações") is not None
+            own_window_open = (
+                win_native.find_window_containing("STREAMING") is not None
+                or win_native.find_window_containing("Mapa de Rede") is not None
+            )
+            if not settings_open and (compact_mode or not own_window_open):
+                hwnd = _get_hwnd()
+                if hwnd:
+                    win_native.set_always_on_top(hwnd, True)
             reassert_topmost_at = time.time() + 1.5
 
-        if not compact_mode and not device_dropdown_open and not renderer.audio_settings_open and not confirm_exit_open and not renderer.log_history_open:
+        if not compact_mode and not device_dropdown_open and not input_device_dropdown_open and not renderer.audio_settings_open and not confirm_exit_open and not renderer.log_history_open:
             mx, my = pygame.mouse.get_pos()
             cw, ch = screen.get_size()
             hover_kind = renderer.splitter_at((mx, my - HEADER_H), cw, ch - HEADER_H) if my >= HEADER_H else None
@@ -888,10 +1127,19 @@ def main():
 
         if compact_mode:
             renderer.draw_compact(screen, theme.COMPACT_COLORKEY)
-            compact_restore_rect = renderer.draw_compact_restore_button(screen)
-            compact_theme_rect = renderer.draw_theme_button(
-                screen, pygame.Rect(compact_restore_rect.right + 2, compact_restore_rect.y, 20, 20)
-            )
+            # Geometry is fixed/deterministic (doesn't depend on hover),
+            # so it's computed up front to check the mouse against the
+            # *whole 3-button cluster* -- hovering any one of the 3
+            # reveals all 3, not just the one directly under the cursor.
+            btn_size = 20
+            restore_rect = pygame.Rect(1, screen.get_height() - btn_size - 1, btn_size, btn_size)
+            move_rect = pygame.Rect(restore_rect.right + 2, restore_rect.y, btn_size, btn_size)
+            theme_rect = pygame.Rect(move_rect.right + 2, restore_rect.y, btn_size, btn_size)
+            cluster_rect = restore_rect.unionall([move_rect, theme_rect])
+            buttons_visible = cluster_rect.collidepoint(pygame.mouse.get_pos())
+            compact_restore_rect = renderer.draw_compact_restore_button(screen, buttons_visible)
+            compact_move_rect = renderer.draw_move_icon_button(screen, move_rect, buttons_visible)
+            compact_theme_rect = renderer.draw_theme_button(screen, theme_rect, visible=buttons_visible)
         else:
             w, h = screen.get_size()
             content = screen.subsurface((0, HEADER_H, w, max(0, h - HEADER_H)))
@@ -901,13 +1149,18 @@ def main():
             screen.fill(theme.BG, (0, 0, w, HEADER_H))
             pygame.draw.line(screen, theme.PANEL_BORDER, (0, HEADER_H - 1), (w, HEADER_H - 1))
 
-            # All action buttons grouped on the right, "Saída" (device
-            # picker) rightmost -- leaves the whole left side free for the
-            # status widget below. "Sempre no topo"/"Modo compacto" moved
-            # to small icon buttons next to the "C" theme button instead
-            # (see below), not in this row anymore.
+            # All action buttons grouped on the right, OUTPUTS/INPUTS (device
+            # pickers) rightmost -- leaves the whole left side free for the
+            # status widget below. "Sempre no topo"/"Modo compacto"/
+            # "Ocultar painel" are all small icon buttons next to the "C"
+            # theme button instead (see below), not in this row. No
+            # explicit "Parar & Salvar" button either -- closing the window
+            # (native X, or ESC) already runs the exact same stop-
+            # recording-if-active-then-save-and-exit path (see the QUIT/
+            # ESCAPE handling above), so a second button doing the same
+            # thing was pure redundancy.
             _layout_buttons_right_to_left(
-                w, 6, STOP_BUTTON_RECT, COLLAPSE_BUTTON_RECT, DEVICE_BUTTON_RECT,
+                w, 6, DEVICE_BUTTON_RECT, INPUT_DEVICE_BUTTON_RECT,
             )
 
             device_display = "Automático (padrão do Windows)"
@@ -917,11 +1170,17 @@ def main():
                         device_display = disp
                         break
 
-            _draw_button(screen, renderer.font_md, DEVICE_BUTTON_RECT, f"Saída: {device_display}",
+            input_device_display = "Automático (padrão do Windows)"
+            if selected_input_device_name is not None:
+                for disp, name in available_input_devices:
+                    if name == selected_input_device_name:
+                        input_device_display = disp
+                        break
+
+            _draw_button(screen, renderer.font_md, DEVICE_BUTTON_RECT, f"OUTPUT: {device_display}",
                          active=device_dropdown_open, accent=renderer.chrome_accent())
-            _draw_button(screen, renderer.font_md, STOP_BUTTON_RECT, "Parar & Salvar", accent=renderer.chrome_accent())
-            _draw_button(screen, renderer.font_md, COLLAPSE_BUTTON_RECT,
-                         "Mostrar painel" if renderer.top_collapsed else "Ocultar painel", accent=renderer.chrome_accent())
+            _draw_button(screen, renderer.font_md, INPUT_DEVICE_BUTTON_RECT, f"INPUT: {input_device_display}",
+                         active=input_device_dropdown_open, accent=renderer.chrome_accent())
 
             live_warn = _compute_live_warn_level(cfg, latest_stats, latest_network, latest_process, renderer.spectrum_available)
             status_level = "crit" if status_critical_active else ("warn" if live_warn else "ok")
@@ -930,24 +1189,34 @@ def main():
             emin, esec = divmod(erem, 60)
             uptime_text = f"{eh:02d}:{emin:02d}:{esec:02d}"
             status_x = 10
-            if status_x + 240 < DEVICE_BUTTON_RECT.x:
+            if status_x + 265 < INPUT_DEVICE_BUTTON_RECT.x:
                 status_dot_rect, status_right_edge = _draw_status_widget(
                     screen, renderer.font_label, renderer.font_value, status_x, 6, 32, status_level, uptime_text,
+                    accent=renderer.chrome_accent(),
                 )
                 theme_button_rect = renderer.draw_theme_button(screen, pygame.Rect(status_right_edge + 14, 6, 22, 22))
                 COMPACT_BUTTON_RECT.update(theme_button_rect.right + 6, 6, 22, 22)
                 TOPMOST_BUTTON_RECT.update(COMPACT_BUTTON_RECT.right + 6, 6, 22, 22)
+                VISIBILITY_BUTTON_RECT.update(TOPMOST_BUTTON_RECT.right + 6, 6, 22, 22)
                 renderer.draw_compact_toggle_icon_button(screen, COMPACT_BUTTON_RECT)
                 renderer.draw_topmost_toggle_icon_button(screen, TOPMOST_BUTTON_RECT, always_on_top)
+                renderer.draw_visibility_toggle_icon_button(screen, VISIBILITY_BUTTON_RECT, renderer.top_collapsed)
             else:
                 status_dot_rect = pygame.Rect(0, 0, 0, 0)  # window too narrow -- no room, no stale hit target
                 theme_button_rect = pygame.Rect(0, 0, 0, 0)
                 COMPACT_BUTTON_RECT.update(0, 0, 0, 0)
                 TOPMOST_BUTTON_RECT.update(0, 0, 0, 0)
+                VISIBILITY_BUTTON_RECT.update(0, 0, 0, 0)
 
             if device_dropdown_open:
                 _, dropdown_row_rects = _draw_device_dropdown(
                     screen, renderer.font_row, DEVICE_BUTTON_RECT, available_devices, selected_device_name,
+                    accent=renderer.chrome_accent(),
+                )
+
+            if input_device_dropdown_open:
+                _, input_dropdown_row_rects = _draw_device_dropdown(
+                    screen, renderer.font_row, INPUT_DEVICE_BUTTON_RECT, available_input_devices, selected_input_device_name,
                     accent=renderer.chrome_accent(),
                 )
 
@@ -1005,6 +1274,11 @@ if __name__ == "__main__":
         # source and from the frozen exe (sys.executable IS the exe there).
         import network_mapper
         network_mapper.main()
+    elif "--streaming" in sys.argv:
+        # Same separate-process pattern as --network-map, dispatched by
+        # the STREAMING button in the ÁUDIO I/O panel (see _launch_streaming).
+        import streaming_window
+        streaming_window.main()
     else:
         try:
             main()

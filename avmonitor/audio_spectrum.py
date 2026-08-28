@@ -20,6 +20,57 @@ from .audio_io import _apply_gain_int16
 from . import win_native
 
 
+def _label_own_audio_session_once() -> None:
+    """Best-effort: give our own WASAPI loopback session a real display
+    name instead of leaving it to show up in Windows' Volume Mixer as "O
+    Nome Não Está Disponível" -- confirmed via a real screenshot from the
+    user's own machine. Opening a loopback capture stream registers a
+    render-direction session under our PID with Windows' audio session
+    manager (a documented WASAPI loopback quirk -- distinct from, and in
+    addition to, the pygame.mixer phantom-session bug already fixed, and
+    the DeviceWatcher/loopback co-occurrence quirk already investigated),
+    and that particular session has no window to inherit
+    a name/icon from, so Explorer shows it nameless -- alarming to see,
+    even though it's silent (confirmed peak=0.0 via IAudioMeterInformation
+    in an earlier investigation). Can't eliminate the session itself
+    without giving up WASAPI loopback capture entirely; renaming it is the
+    achievable fix. Runs once per stream open, on its own short-lived
+    thread (own COM apartment, never the real-time capture thread) with a
+    few retries spaced out since the session may take a moment to
+    register after the stream opens.
+    """
+    def _worker():
+        import os
+        try:
+            import comtypes
+            comtypes.CoInitialize()
+        except Exception:
+            return
+        try:
+            from pycaw.pycaw import AudioUtilities
+            pid = os.getpid()
+            for _ in range(6):
+                try:
+                    for s in AudioUtilities.GetAllSessions():
+                        proc = s.Process
+                        if proc is not None and proc.pid == pid:
+                            try:
+                                if s.DisplayName != "brndz.wav Monitor":
+                                    s.DisplayName = "brndz.wav Monitor"
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
+                time.sleep(0.5)
+        finally:
+            try:
+                comtypes.CoUninitialize()
+            except Exception:
+                pass
+
+    threading.Thread(target=_worker, daemon=True, name="AudioSessionLabeler").start()
+
+
 def _live_default_output_name() -> Optional[str]:
     """The Windows default output device's friendly name, straight from
     Core Audio (COM) via pycaw -- used instead of trusting pyaudiowpatch's
@@ -126,6 +177,11 @@ class AudioSpectrumAnalyzer(threading.Thread):
         # is fine across threads here (single reference, GIL-atomic) --
         # read once per poll cycle in _find_loopback_device.
         self._device_override: Optional[str] = None
+        # Set once run() starts its DeviceWatcher -- lets set_device_override()
+        # poke it into re-resolving immediately instead of waiting out its
+        # normal poll interval. Plain reference swap across threads
+        # (GIL-atomic), same pattern as everything else here.
+        self._watcher = None
 
         # Recording hook: main.py points this at AudioRecorder.write() when
         # REC is active (None otherwise). Deliberately just a plain
@@ -156,11 +212,15 @@ class AudioSpectrumAnalyzer(threading.Thread):
 
     def set_device_override(self, loopback_name: Optional[str]):
         """None to go back to following the Windows default; otherwise a
-        loopback device name from list_output_devices(). Takes effect on
-        the next device-poll cycle (audio_device_poll_s), not instantly --
-        that's fine, it's a deliberate user choice, not a live meter value.
+        loopback device name from list_output_devices(). Pokes the
+        DeviceWatcher (if it's already running) to re-resolve immediately,
+        so a manual pick from the UI is reflected in well under a second
+        instead of waiting out the normal device-poll cadence.
         """
         self._device_override = loopback_name
+        watcher = self._watcher
+        if watcher is not None:
+            watcher.poke()
 
     def set_out_gain_db(self, gain_db: float):
         """Live-adjust the OUT boost from the settings popup -- same
@@ -203,6 +263,7 @@ class AudioSpectrumAnalyzer(threading.Thread):
         # real audible glitches in exactly what was being captured/
         # recorded. See util.DeviceWatcher's docstring.
         watcher = DeviceWatcher(self._find_loopback_device, self.cfg.audio_device_poll_s)
+        self._watcher = watcher
         watcher.start()
         deadline = time.time() + 2.0
         while watcher.current is None and time.time() < deadline and not self._stop_event.is_set():
@@ -260,8 +321,8 @@ class AudioSpectrumAnalyzer(threading.Thread):
             bin_indices = self._precompute_band_bins(sample_rate)
             freq_per_bin = sample_rate / self.fft_size
             n_fft_bins = self.fft_size // 2 + 1
-            peak_lo = max(1, int(self.cfg.eq_min_freq / freq_per_bin))
-            peak_hi = min(n_fft_bins, int(min(self.cfg.eq_max_freq, sample_rate / 2) / freq_per_bin))
+            peak_lo = max(1, int(round(self.cfg.eq_min_freq / freq_per_bin)))
+            peak_hi = min(n_fft_bins, int(round(min(self.cfg.eq_max_freq, sample_rate / 2) / freq_per_bin)))
 
             stream = p.open(
                 format=pyaudio.paInt16,
@@ -275,6 +336,8 @@ class AudioSpectrumAnalyzer(threading.Thread):
             self._publish_error(f"Erro abrindo dispositivo de áudio: {e}")
             self._stop_event.wait(self.cfg.audio_device_poll_s)
             return watcher.current
+
+        _label_own_audio_session_once()
 
         try:
             return self._capture_loop(p, pyaudio, stream, device, channels, bin_indices, freq_per_bin, peak_lo, peak_hi, master_volume, watcher)
@@ -330,8 +393,14 @@ class AudioSpectrumAnalyzer(threading.Thread):
 
         bins = []
         for i in range(self.cfg.eq_bands):
-            start = int(edges[i] / freq_per_bin)
-            end = int(edges[i + 1] / freq_per_bin)
+            # Round to the *nearest* bin, not floor -- truncating always
+            # rounds every edge down, systematically shifting each band's
+            # actual analyzed range below its labeled one by up to a full
+            # bin width (23.4Hz at the default 2048-sample/48kHz FFT).
+            # Rounding halves that worst-case error and removes the
+            # directional bias entirely.
+            start = int(round(edges[i] / freq_per_bin))
+            end = int(round(edges[i + 1] / freq_per_bin))
             start = max(0, min(start, n_fft_bins - 1))
             end = max(start + 1, min(end, n_fft_bins))
             bins.append((start, end))
@@ -374,18 +443,18 @@ class AudioSpectrumAnalyzer(threading.Thread):
         sample_rate = int(device["defaultSampleRate"])
         self.current_sample_rate = sample_rate
         self.current_channels = channels
-        next_device_check = time.time() + self.cfg.audio_device_poll_s
-
         while not self._stop_event.is_set():
-            if time.time() >= next_device_check:
-                next_device_check = time.time() + self.cfg.audio_device_poll_s
-                # Instant read of DeviceWatcher's own thread, not a fresh
-                # enumeration call here -- see DeviceWatcher's docstring
-                # for why doing the real work inline used to risk stalling
-                # this loop long enough to glitch whatever's capturing.
-                current = watcher.current
-                if current is None or current["name"] != device_name:
-                    return current  # tell the caller to reopen against the new default
+            # Checked every chunk, not on a timer -- this is just an
+            # attribute read of DeviceWatcher's own thread (no enumeration
+            # work happens here, see DeviceWatcher's docstring), so it
+            # costs nothing to check it this often. Used to be gated
+            # behind a periodic timer at the same cadence as DeviceWatcher's
+            # own poll, which stacked an extra up-to-poll_s delay on top of
+            # whatever DeviceWatcher itself took to notice a manual device
+            # pick from the UI.
+            current = watcher.current
+            if current is None or current["name"] != device_name:
+                return current  # tell the caller to reopen against the new default
 
             master_volume.refresh()
             try:
@@ -473,7 +542,14 @@ class AudioSpectrumAnalyzer(threading.Thread):
             # Dominant frequency: exact FFT-bin peak within the analyzed
             # range (not the coarser log-band aggregate), so "what note/
             # frequency is playing right now" reads precisely instead of
-            # just which wide band lit up.
+            # just which wide band lit up. Refined to sub-bin precision via
+            # quadratic (parabolic) interpolation of the log-magnitude
+            # around the peak bin -- a real tone almost never lines up
+            # exactly on a bin center (23.4Hz apart at the default FFT
+            # size), so reporting the raw bin's own frequency alone can be
+            # off by up to half a bin width even when the peak bin itself
+            # is correctly identified. Standard technique for refining an
+            # FFT peak estimate past the DFT's own bin resolution.
             peak_freq_hz = None
             peak_db = None
             if peak_hi > peak_lo:
@@ -481,7 +557,15 @@ class AudioSpectrumAnalyzer(threading.Thread):
                 peak_mag = magnitude[peak_bin]
                 peak_db = 20.0 * np.log10(peak_mag + 1e-9)
                 if peak_db > self._floor_db + 8:  # ignore near-silence noise bins
-                    peak_freq_hz = peak_bin * freq_per_bin
+                    bin_offset = 0.0
+                    if 0 < peak_bin < len(magnitude) - 1:
+                        alpha = 20.0 * np.log10(magnitude[peak_bin - 1] + 1e-9)
+                        beta = 20.0 * np.log10(magnitude[peak_bin] + 1e-9)
+                        gamma = 20.0 * np.log10(magnitude[peak_bin + 1] + 1e-9)
+                        denom = alpha - 2.0 * beta + gamma
+                        if abs(denom) > 1e-9:
+                            bin_offset = max(-0.5, min(0.5, 0.5 * (alpha - gamma) / denom))
+                    peak_freq_hz = (peak_bin + bin_offset) * freq_per_bin
 
             push_latest(self.out_queue, SpectrumFrame(
                 bands=self._band_out.copy(), available=True,

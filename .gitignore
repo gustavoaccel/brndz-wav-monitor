@@ -8,3 +8,4 @@ config.json
 build/
 dist/
 rec/
+_diag*/

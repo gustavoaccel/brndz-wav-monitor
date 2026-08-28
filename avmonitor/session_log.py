@@ -43,6 +43,38 @@ def resolve_log_dir(cfg) -> "tuple[Path, bool]":
     return Path(cfg.fallback_log_dir), True
 
 
+def cleanup_old_reports(log_dir: Path, max_age_days: int = 90) -> int:
+    """Deletes this app's own session report files (metrics/events CSV +
+    Markdown summary) older than `max_age_days` from `log_dir` -- never
+    touches anything else in that folder (audio recordings live in a
+    separate directory entirely, and the glob is scoped to the exact
+    "av_monitor_*" naming this app itself writes). Never raises: called
+    once at startup, a permission error here (e.g. a read-only file, a
+    drive hiccup) should degrade to "removed fewer than expected", not
+    crash startup. Returns how many files were removed.
+    """
+    if not log_dir.exists():
+        return 0
+    cutoff = time.time() - max_age_days * 86400
+    removed = 0
+    try:
+        seen = set()
+        for pattern in ("av_monitor_*.csv", "av_monitor_*_resumo.md"):
+            for path in log_dir.glob(pattern):
+                if path in seen:
+                    continue
+                seen.add(path)
+                try:
+                    if path.is_file() and path.stat().st_mtime < cutoff:
+                        path.unlink()
+                        removed += 1
+                except Exception:
+                    continue
+    except Exception:
+        return removed
+    return removed
+
+
 def _fmt_disks(disks) -> str:
     parts = []
     for d in disks:

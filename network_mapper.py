@@ -15,8 +15,10 @@ from pathlib import Path
 import pygame
 
 from avmonitor.config import load_config
-from avmonitor.network_scan import HostInfo, local_network_prefix, save_network_map, scan_network
+from avmonitor.network_scan import local_network_prefix, save_network_map, scan_network
 from avmonitor.ui import theme
+from avmonitor.ui.renderer import apply_theme_to_window
+from avmonitor import win_native
 
 ROW_H = 24
 HEADER_H = 60
@@ -26,6 +28,13 @@ FOOTER_H = 50
 def _resource_path(name: str) -> Path:
     base = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
     return base / name
+
+
+def _get_hwnd():
+    try:
+        return pygame.display.get_wm_info().get("window")
+    except Exception:
+        return None
 
 
 def _draw_button(surface, font, rect, text, enabled=True, active=False):
@@ -69,8 +78,18 @@ def main():
     # knows about -- this window doesn't take CLI args of its own, it just
     # wants the same config.json defaults (drive_label, fallback_log_dir).
     cfg = load_config([])
+    # Opens already matching whichever EQ color palette was last
+    # selected in the main app (persisted to config.json on every theme
+    # change there) -- a one-shot read, not a live sync; see
+    # renderer.apply_theme_to_window()'s docstring.
+    apply_theme_to_window(cfg.eq_color_theme)
 
-    pygame.init()
+    # See main.py's own comment on this same substitution -- pygame.init()
+    # opens a real audio-output stream via pygame.mixer that this app
+    # never uses, registering a phantom "audio session" for this process
+    # in Windows' volume mixer for no reason.
+    pygame.display.init()
+    pygame.font.init()
     pygame.display.set_caption("brndz.wav — Mapa de Rede")
     try:
         pygame.display.set_icon(pygame.image.load(_resource_path("brndz_icon_512.png")))
@@ -124,9 +143,19 @@ def main():
 
     start_scan()
 
+    # Always-on-top mirrors the main app's own "sempre no topo" toggle
+    # live -- this window has no toggle of its own, explicit request:
+    # topmost ONLY while the main app's is active, tracking it in real
+    # time (not a one-shot read at launch) by asking the OS directly
+    # whether the main window currently carries WS_EX_TOPMOST. No IPC or
+    # config polling needed for that -- see win_native.is_window_topmost().
+    hwnd = _get_hwnd()
+    is_topmost = False
+    reassert_topmost_at = 0.0
+
     running = True
     while running:
-        dt = clock.tick(30) / 1000.0
+        clock.tick(30)
 
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
@@ -181,6 +210,56 @@ def main():
             elif msg[0] == "error":
                 scanning = False
                 status_msg = f"Erro no scan: {msg[1]}"
+
+        if hwnd and time.time() >= reassert_topmost_at:
+            reassert_topmost_at = time.time() + 1.5
+            # Reads main.py's own always_on_top/compact_mode_active state
+            # from config.json rather than querying its live window style
+            # cross-process -- that approach was tried first and confirmed
+            # unreliable in the field (this window losing topmost after
+            # certain OS-level window-manager disruptions, e.g. switching
+            # to another app's fullscreen video, and not recovering). See
+            # Config.always_on_top's docstring / streaming_window.py's own
+            # reassert block for the full reasoning. Only the main
+            # window's mere *existence* is still checked live (a plain
+            # title lookup, not a style-bit read) -- a cheap sanity net
+            # against a stale flag left behind by an unclean shutdown.
+            main_hwnd = win_native.find_window_containing("brndz.wav Monitor")
+            if main_hwnd is None:
+                wants_topmost = False
+                yield_front_to_eq = False
+            else:
+                live_cfg = load_config([])
+                # Real bug fixed here: this used to be
+                # `live_cfg.always_on_top and not live_cfg.compact_mode_active`
+                # -- i.e. fully DROP OUT of the topmost band the instant the
+                # EQ compact overlay was active, on the theory that this
+                # window should rank "below EQ". But Windows only has a
+                # binary topmost/not-topmost distinction, no sub-priority
+                # levels -- dropping out entirely didn't rank this window
+                # below EQ specifically, it sank it below EVERY window,
+                # including an ordinary browser tab or someone else's
+                # fullscreen video, which is exactly the bug reported
+                # ("clico em outra janela... a janela fecha"/falls behind).
+                # Now it keeps its own topmost membership for as long as its
+                # own condition (the toggle) says so, and only *yields the
+                # front of the band* (skips re-claiming it) while EQ compact
+                # is active, letting EQ's own reassert cycle win the front
+                # spot instead of the two fighting over it every 1.5s.
+                wants_topmost = live_cfg.always_on_top
+                yield_front_to_eq = live_cfg.compact_mode_active
+            if wants_topmost != is_topmost:
+                win_native.set_always_on_top(hwnd, wants_topmost)
+                is_topmost = wants_topmost
+            elif wants_topmost and not yield_front_to_eq and win_native.find_window_containing("Configurações") is None:
+                # Still reassert periodically even when the state hasn't
+                # changed -- another topmost window (STREAMING) could
+                # have reclaimed the front of the band since our last
+                # check. Skipped while Windows' own Settings window is
+                # open -- that one gets absolute priority regardless of
+                # any other window's always-on-top state (see main.py's
+                # _pin_settings_window_topmost).
+                win_native.set_always_on_top(hwnd, True)
 
         w, h = screen.get_size()
         screen.fill(theme.BG)

@@ -118,6 +118,47 @@ class Config:
     window_width: int = 1280
     window_height: int = 800
 
+    # STREAMING window (YouTube live-stream metrics dashboard): API key is
+    # tied to the user's Google account, rarely changes, so it persists
+    # like log_directory_override does. Video ID is last-used-as-
+    # convenience (pre-fills the field next launch) -- easily overwritten
+    # per event via the window's own "Trocar vídeo" button. Empty API key
+    # means the dashboard hasn't been set up yet; the window itself walks
+    # the user through getting one instead of failing silently.
+    youtube_api_key: str = ""
+    youtube_video_id: str = ""
+    youtube_poll_s: float = 15.0
+
+    # Whatever EQ color palette (the "C"/palette button) was active in
+    # the main app the last time it ran -- persisted so a derived window
+    # (Mapa de Rede, STREAMING), opened as its own separate process, can
+    # open already matching it instead of always defaulting to "quente".
+    # A one-shot read at that window's own startup (see
+    # renderer.apply_theme_to_window()), not a live sync -- if the user
+    # changes theme in the main app while a derived window is already
+    # open, it only picks up the new one on its next launch.
+    eq_color_theme: str = "quente"
+
+    # Live status channel for derived windows (STREAMING, Mapa de Rede)
+    # to read the main window's always-on-top state without querying
+    # live OS window state cross-process. Written by main.py every time
+    # either changes; re-read (via a fresh load_config()) every ~1.5s by
+    # the derived windows' own reassert-topmost loops instead of
+    # win_native.is_window_topmost()/find_window_containing() on the main
+    # window. That EnumWindows/GetWindowLongW-based approach was tried
+    # first and confirmed unreliable: STREAMING would lose its topmost
+    # status and not recover after certain OS-level window-manager
+    # disruptions (reported directly -- clicking into another app's
+    # fullscreen video made STREAMING drop behind and stay there, while
+    # the EQ compact overlay, which asserts unconditionally with no
+    # cross-process query at all, was unaffected) -- most likely a
+    # transient EnumWindows/GetWindowLongW misread during exactly that
+    # kind of transition being latched in as "main isn't topmost" and
+    # never retried since the window's own state matched afterward. A
+    # config.json read isn't vulnerable to that class of glitch at all.
+    always_on_top: bool = False
+    compact_mode_active: bool = False
+
     def to_dict(self) -> dict:
         return asdict(self)
 

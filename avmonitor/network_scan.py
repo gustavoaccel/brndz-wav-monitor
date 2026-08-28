@@ -8,8 +8,7 @@ Pure logic, no UI -- `network_mapper.py` drives this from a pygame window.
 import re
 import socket
 import subprocess
-import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -186,7 +185,14 @@ def scan_network(
 
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
         futures = {pool.submit(_ping_once, ip, ping_timeout_ms): ip for ip in targets}
-        for future in futures:
+        # as_completed, not iterating `futures` directly -- a dict/list of
+        # futures preserves *submission* order, so iterating it directly
+        # blocks on future.result() for whichever target was submitted
+        # first even if slower/later ones already finished. One host
+        # timing out (no reply at all) could make the progress bar look
+        # stuck well past where the sweep actually was, since 253 other
+        # already-done results were waiting behind it in iteration order.
+        for future in as_completed(futures):
             if stop_check and stop_check():
                 break
             ip = futures[future]
@@ -237,7 +243,7 @@ def save_network_map(hosts: "List[HostInfo]", prefix: str, cfg) -> Path:
     lines = [
         f"# Scan de rede - {prefix}.0/24",
         f"Gerado em: {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}",
-        f"Máquina que rodou o scan: brndz.wav Monitor",
+        "Máquina que rodou o scan: brndz.wav Monitor",
         "",
         f"{len(hosts)} dispositivos respondendo de 254 endereços testados.",
         "",

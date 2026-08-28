@@ -12,5 +12,9 @@
   "recording_directory": "",
   "recording_sample_rate": 48000,
   "recording_channels": 2,
-  "recording_bit_depth": 16
+  "recording_bit_depth": 16,
+  "eq_color_theme": "quente",
+  "youtube_api_key": "",
+  "youtube_video_id": "",
+  "youtube_poll_s": 15.0
 }

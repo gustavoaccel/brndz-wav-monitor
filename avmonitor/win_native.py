@@ -103,6 +103,59 @@ def set_always_on_top(hwnd: int, enabled: bool) -> bool:
     return bool(user32.SetWindowPos(hwnd, insert_after, 0, 0, 0, 0, _SWP_NOMOVE | _SWP_NOSIZE | _SWP_NOACTIVATE))
 
 
+_WS_EX_TOPMOST = 0x00000008
+
+
+def is_window_topmost(hwnd: int) -> bool:
+    """Real, live OS state of whether `hwnd` currently carries the
+    WS_EX_TOPMOST extended style -- used so a derived window (Mapa de
+    Rede, STREAMING) can mirror the main app's own "sempre no topo"
+    toggle live, by directly asking Windows what the main window's
+    current style bits are, rather than needing any IPC/config-file
+    polling to learn that state from a different process. Reuses the
+    same GetWindowLongW(GWL_EXSTYLE) call already declared for the
+    colorkey-transparency helpers below."""
+    try:
+        return bool(user32.GetWindowLongW(hwnd, _GWL_EXSTYLE) & _WS_EX_TOPMOST)
+    except Exception:
+        return False
+
+
+_WNDENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+user32.EnumWindows.argtypes = [_WNDENUMPROC, wintypes.LPARAM]
+user32.EnumWindows.restype = wintypes.BOOL
+user32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+user32.GetWindowTextW.restype = ctypes.c_int
+user32.IsWindowVisible.argtypes = [wintypes.HWND]
+user32.IsWindowVisible.restype = wintypes.BOOL
+
+
+def find_window_containing(substring: str) -> Optional[int]:
+    """Look up a visible top-level window whose title *contains*
+    `substring` (case-sensitive) -- for windows we don't control and
+    whose exact caption we can't hardcode (e.g. the Windows Settings app,
+    hosted by ApplicationFrameHost.exe under a generic window class).
+    Used so this app's own window can tell Settings is open right now
+    (opened by the MIXER button) and defer reclaiming the front of the
+    topmost z-order band to it, rather than fighting it for that spot on
+    each one's own periodic HWND_TOPMOST reassertion. Returns the first
+    match found while enumerating; None if nothing matches."""
+    found = []
+
+    def _cb(hwnd, _lparam):
+        if not user32.IsWindowVisible(hwnd):
+            return True
+        buf = ctypes.create_unicode_buffer(256)
+        user32.GetWindowTextW(hwnd, buf, 256)
+        if substring in buf.value:
+            found.append(hwnd)
+            return False  # stop enumerating, we have our match
+        return True
+
+    user32.EnumWindows(_WNDENUMPROC(_cb), 0)
+    return found[0] if found else None
+
+
 # ---- compact/overlay window mode: colorkey transparency + manual drag -----
 #
 # Chosen over pywin32 for the same reason as the rest of this module: it's
@@ -143,6 +196,51 @@ def enable_colorkey_transparency(hwnd: int, rgb: "tuple[int, int, int]") -> bool
 def disable_layered(hwnd: int) -> None:
     style = user32.GetWindowLongW(hwnd, _GWL_EXSTYLE)
     user32.SetWindowLongW(hwnd, _GWL_EXSTYLE, style & ~_WS_EX_LAYERED)
+
+
+def get_screen_size() -> "Optional[tuple[int, int]]":
+    """Primary monitor's resolution (SM_CXSCREEN/SM_CYSCREEN), so the main
+    window can open at a size proportional to the actual screen instead of
+    a fixed 1280x800 -- too small on a 4K rig, too big (or off-screen) on
+    a laptop or a smaller field monitor. Returns None if the call fails
+    for any reason, so the caller can fall back to the config default.
+    """
+    try:
+        w = user32.GetSystemMetrics(0)  # SM_CXSCREEN
+        h = user32.GetSystemMetrics(1)  # SM_CYSCREEN
+        if w > 0 and h > 0:
+            return w, h
+    except Exception:
+        pass
+    return None
+
+
+user32.GetAsyncKeyState.argtypes = [ctypes.c_int]
+user32.GetAsyncKeyState.restype = ctypes.c_short
+_VK_LBUTTON = 0x01
+
+
+def is_left_button_down() -> bool:
+    """Real OS-level left mouse button state, independent of whether
+    SDL/pygame actually delivered a MOUSEBUTTONUP event for it -- used as
+    a safety net for the compact mode window-drag flag (see main.py).
+    A frameless window being dragged has no OS-managed titlebar drag, so
+    this app tracks MOUSEMOTION itself while a "dragging" flag is set;
+    if the button is released while the cursor happens to be outside the
+    (small, frameless) window's own bounds, pygame/SDL don't reliably
+    deliver that MOUSEBUTTONUP to the app at all, since it never
+    "captured" the mouse for events beyond its own client area. The flag
+    then never clears, and every subsequent MOUSEMOTION anywhere keeps
+    yanking the window around -- confirmed as the likely explanation for
+    the compact window "disappearing" (it's not gone, it flew off-screen
+    following stale drag state) reported after real usage. Polling the
+    real button state once a frame lets the app self-correct regardless
+    of whether the matching event ever arrives.
+    """
+    try:
+        return bool(user32.GetAsyncKeyState(_VK_LBUTTON) & 0x8000)
+    except Exception:
+        return False
 
 
 def get_cursor_pos() -> "tuple[int, int]":

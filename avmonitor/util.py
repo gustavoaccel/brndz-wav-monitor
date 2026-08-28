@@ -93,10 +93,25 @@ class DeviceWatcher(threading.Thread):
         self._resolve_fn = resolve_fn
         self._poll_s = poll_s
         self._stop_event = threading.Event()
+        # Set by poke() (a plain bool, GIL-atomic, same pattern as every
+        # other cross-thread flag in this codebase) to cut the sleep
+        # between polls short -- see poke()'s docstring.
+        self._poke_requested = False
         self.current = None  # whatever resolve_fn(p, pyaudio) returns; None until the first poll lands
 
     def stop(self):
         self._stop_event.set()
+
+    def poke(self):
+        """Ask this watcher to re-resolve the current device *now* instead
+        of waiting out the rest of its poll_s sleep -- called when the user
+        explicitly picks a device from the INPUTS/OUTPUTS dropdown, so the
+        change is reflected in well under a second instead of up to
+        poll_s (1.5s) later. Only meaningful for a manual override; the
+        periodic poll (catching the Windows default device changing on
+        its own) still runs at its normal cadence otherwise.
+        """
+        self._poke_requested = True
 
     def run(self):
         try:
@@ -120,8 +135,24 @@ class DeviceWatcher(threading.Thread):
                     self.current = self._resolve_fn(p, pyaudio)
                 except Exception:
                     pass
-                if self._stop_event.wait(self._poll_s):
-                    break
+                # Sleep in short slices (instead of one self._stop_event.
+                # wait(self._poll_s) call) so poke() can cut a stale wait
+                # short -- this thread already does its own heavyweight
+                # enumeration on a private PyAudio()/thread, so slicing
+                # the sleep costs nothing on the real-time capture path.
+                slept = 0.0
+                slice_s = 0.05
+                woke_early = False
+                while slept < self._poll_s:
+                    if self._stop_event.wait(min(slice_s, self._poll_s - slept)):
+                        return
+                    slept += slice_s
+                    if self._poke_requested:
+                        self._poke_requested = False
+                        woke_early = True
+                        break
+                if woke_early:
+                    continue
         finally:
             with PORTAUDIO_INIT_LOCK:
                 try:

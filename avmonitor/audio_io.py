@@ -12,7 +12,7 @@ nothing suggests input behaves any differently).
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import numpy as np
 
@@ -37,6 +37,57 @@ def _apply_gain_int16(raw: bytes, gain: float) -> bytes:
     samples *= gain
     np.clip(samples, -32768.0, 32767.0, out=samples)
     return samples.astype(np.int16).tobytes()
+
+
+def list_input_devices() -> "List[Tuple[str, str]]":
+    """(display_name, device_name) for every WASAPI input-capable device,
+    for the INPUTS picker UI -- mirrors audio_spectrum.list_output_devices().
+    `device_name` is what AudioIOMonitor.set_device_override() expects.
+    """
+    try:
+        import pyaudiowpatch as pyaudio
+    except Exception:
+        return []
+
+    devices = []
+    try:
+        # Same short-lived-construction-under-the-shared-lock pattern as
+        # list_output_devices() -- see util.PORTAUDIO_INIT_LOCK's docstring.
+        with PORTAUDIO_INIT_LOCK:
+            p = pyaudio.PyAudio()
+        try:
+            try:
+                wasapi_host_index = p.get_host_api_info_by_type(pyaudio.paWASAPI)["index"]
+            except Exception:
+                wasapi_host_index = None
+            seen = set()
+            for i in range(p.get_device_count()):
+                info = p.get_device_info_by_index(i)
+                if info.get("maxInputChannels", 0) <= 0:
+                    continue
+                if wasapi_host_index is not None and info.get("hostApi") != wasapi_host_index:
+                    continue
+                # WASAPI also exposes every loopback-capable OUTPUT as a
+                # pseudo-input device (same mechanism list_output_devices()
+                # uses on purpose) -- confirmed directly on this machine
+                # (Realtek/HyperX speakers all show up here too). Excluded:
+                # this picker is for real microphones/input interfaces only.
+                if info.get("isLoopbackDevice") or "[Loopback]" in info["name"]:
+                    continue
+                name = info["name"]
+                if name in seen:
+                    continue
+                seen.add(name)
+                devices.append((name, name))
+        finally:
+            with PORTAUDIO_INIT_LOCK:
+                try:
+                    p.terminate()
+                except Exception:
+                    pass
+    except Exception:
+        return []
+    return devices
 
 
 def _live_default_input_name() -> Optional[str]:
@@ -88,6 +139,16 @@ class AudioIOMonitor(threading.Thread):
         self.out_queue = out_queue
         self._stop_event = threading.Event()
         self._last_device_name: Optional[str] = None
+        # None = follow the Windows default input device automatically;
+        # otherwise a device name from list_input_devices(), picked
+        # explicitly by the user in the UI. Same GIL-atomic plain-attribute
+        # pattern as AudioSpectrumAnalyzer's _device_override.
+        self._device_override: Optional[str] = None
+        # Set once run() starts its DeviceWatcher -- lets set_device_override()
+        # poke it into re-resolving immediately instead of waiting out its
+        # normal poll interval. Read/written across threads as a plain
+        # reference swap (GIL-atomic), same pattern as everything else here.
+        self._watcher = None
         self._clip_active = False
         self._clip_streak = 0
         self._no_data_active = False
@@ -109,6 +170,18 @@ class AudioIOMonitor(threading.Thread):
 
     def stop(self):
         self._stop_event.set()
+
+    def set_device_override(self, device_name: Optional[str]):
+        """None to go back to following the Windows default; otherwise a
+        device name from list_input_devices(). Pokes the DeviceWatcher (if
+        it's already running) to re-resolve immediately, so a manual pick
+        from the UI takes effect in well under a second instead of waiting
+        out the normal device-poll cadence.
+        """
+        self._device_override = device_name
+        watcher = self._watcher
+        if watcher is not None:
+            watcher.poke()
 
     def set_gain_db(self, gain_db: float):
         """Live-adjust the mic boost from the UI settings popup (main
@@ -159,6 +232,7 @@ class AudioIOMonitor(threading.Thread):
         # cause real audible glitches in exactly what was being captured/
         # recorded (the mic recording). See util.DeviceWatcher's docstring.
         watcher = DeviceWatcher(lambda p, _pyaudio: self._find_input_device(p), self.cfg.audio_device_poll_s)
+        self._watcher = watcher
         watcher.start()
         deadline = time.time() + 2.0
         while watcher.current is None and time.time() < deadline and not self._stop_event.is_set():
@@ -240,6 +314,13 @@ class AudioIOMonitor(threading.Thread):
             wasapi_host_index = None
         wasapi_inputs = [d for d in inputs if d.get("hostApi") == wasapi_host_index] if wasapi_host_index is not None else []
 
+        override = self._device_override
+        if override is not None:
+            for d in inputs:
+                if d.get("name") == override:
+                    return d
+            return None
+
         live_name = _live_default_input_name()
         if live_name is not None:
             for d in wasapi_inputs:
@@ -293,20 +374,20 @@ class AudioIOMonitor(threading.Thread):
             self._stop_event.wait(self.cfg.audio_device_poll_s)
             return
 
-        next_device_check = time.time() + self.cfg.audio_device_poll_s
         first_publish = True
         try:
             while not self._stop_event.is_set():
-                if time.time() >= next_device_check:
-                    next_device_check = time.time() + self.cfg.audio_device_poll_s
-                    # Instant read of DeviceWatcher's own thread, not a
-                    # fresh enumeration call here -- see DeviceWatcher's
-                    # docstring for why doing the real work inline used to
-                    # risk stalling this loop long enough to glitch the mic
-                    # capture/recording.
-                    current = watcher.current
-                    if current is None or current.get("name") != name:
-                        return  # outer loop rediscovers/reopens
+                # Checked every chunk, not on a timer -- this is just an
+                # attribute read of DeviceWatcher's own thread (no
+                # enumeration work happens here, see DeviceWatcher's
+                # docstring), so it costs nothing to check it this often.
+                # Used to be gated behind a periodic timer at the same
+                # cadence as DeviceWatcher's own poll, which stacked an
+                # extra up-to-poll_s delay on top of whatever DeviceWatcher
+                # itself took to notice a manual device pick from the UI.
+                current = watcher.current
+                if current is None or current.get("name") != name:
+                    return  # outer loop rediscovers/reopens
 
                 result = self._read_with_timeout(stream, _CHUNK, timeout_s=2.5)
                 if result is None:
